@@ -1,0 +1,227 @@
+/**
+ * Integration test: mounts the plugin's /pack/api route against a stubbed
+ * ctx and drives the full release flow on a FAKE XCC-Deluxe project tree
+ * (copy + zip + numbering), plus read-only checks against the REAL project
+ * (D:\Work\HoloX\XCC-Deluxe) and job-machinery error paths.
+ *
+ * Run: node --test test/integration.test.mjs
+ * Requires the local stub node_modules/@deepseek-ai/dsh-tools (dev only).
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { promises as fs } from 'node:fs';
+import { spawn } from 'node:child_process';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { apply } from '../lib/index.js';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const PLUGIN_ROOT = path.resolve(HERE, '..');
+const REAL_PROJECT = 'D:\\Work\\HoloX\\XCC-Deluxe';
+
+let route = null;
+const registeredTools = [];
+const ctx = {
+  sessions: { get: () => ({ header: { cwd: CURRENT_CWD } }) },
+  webRuntime: { trustedHosts: [] },
+  webServer: { register: (d) => { route = d; } },
+  tools: { register: (t) => { registeredTools.push(t); } },
+  effect: (fn) => fn(),
+};
+apply(ctx);
+
+let CURRENT_CWD = process.cwd();
+
+function makeReq(apiMethod, bodyObj) {
+  const body = JSON.stringify(bodyObj || {});
+  let dataCb = null;
+  let endCb = null;
+  const req = {
+    method: 'POST',
+    url: '/pack/api/' + apiMethod,
+    headers: { host: '127.0.0.1:3080' },
+    destroy: () => {},
+    on: (ev, cb) => {
+      if (ev === 'data') dataCb = cb;
+      if (ev === 'end') endCb = cb;
+      return req;
+    },
+  };
+  req.__start = () => {
+    dataCb(Buffer.from(body));
+    endCb();
+  };
+  return req;
+}
+
+function makeRes() {
+  return {
+    status: 0,
+    body: '',
+    writeHead(s) { this.status = s; },
+    end(b) { this.body = b || ''; },
+  };
+}
+
+async function call(method, body) {
+  const req = makeReq(method, body);
+  const res = makeRes();
+  const pending = route.handler(req, res);
+  req.__start();
+  await pending;
+  return { status: res.status, json: JSON.parse(res.body) };
+}
+
+async function waitJob(pollMethod, jobId, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const { status, json } = await call(pollMethod, { jobId });
+    assert.equal(status, 200);
+    const v = json.value;
+    if (!v.running && v.done) return v;
+    if (Date.now() > deadline) throw new Error(`job ${jobId} did not finish in ${timeoutMs}ms (last: ${JSON.stringify(v)})`);
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
+async function makeFakeProject() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-pack-fake-'));
+  const proj = path.join(root, 'XCC-Deluxe');
+  const win = path.join(proj, 'Saved', 'Windows');
+  const saved = path.join(proj, 'Saved');
+  await fs.mkdir(path.join(win, 'XCC', 'HTML', 'dist'), { recursive: true });
+  await fs.mkdir(path.join(win, 'Engine', 'Binaries'), { recursive: true });
+  await fs.mkdir(path.join(proj, 'Web'), { recursive: true });
+  await fs.writeFile(path.join(proj, 'XCC.uproject'), '{}');
+  await fs.writeFile(path.join(win, 'XCC.exe'), 'fake exe');
+  await fs.writeFile(path.join(win, 'Manifest_UFSFiles_Win64.txt'), 'm');
+  await fs.writeFile(path.join(win, 'XCC', 'HTML', 'dist', 'index.html'), '<html>fake</html>');
+  await fs.writeFile(path.join(win, 'Engine', 'Binaries', 'dummy.dll'), 'dll');
+  // pre-existing release from a previous day
+  await fs.mkdir(path.join(saved, 'XCC-Deluxe-20260921'), { recursive: true });
+  await fs.writeFile(path.join(saved, 'XCC-Deluxe-20260921', 'XCC.exe'), 'old');
+  return { root, proj, saved, win };
+}
+
+test('plugin applies: route + 4 agent tools registered', () => {
+  assert.ok(route);
+  assert.equal(route.kind, 'prefix');
+  assert.equal(route.path, '/pack/api');
+  const names = registeredTools.map((t) => t.name);
+  for (const n of ['xcc_pack', 'xcc_web_build', 'xcc_release', 'xcc_job']) {
+    assert.ok(names.includes(n), `missing tool ${n}`);
+  }
+});
+
+test('root + nextName + release flow on a fake project', async () => {
+  const fake = await makeFakeProject();
+  try {
+    CURRENT_CWD = fake.proj;
+
+    const root = await call('root', {});
+    assert.equal(root.status, 200);
+    assert.equal(root.json.value.projectRoot, fake.proj);
+    assert.equal(root.json.value.outputDir, fake.win);
+    assert.equal(root.json.value.hasBuild, true);
+    const names = root.json.value.releases.map((r) => r.name);
+    assert.deepEqual(names, ['XCC-Deluxe-20260921']);
+
+    // 1. first of the day → plain name
+    const n1 = await call('nextName', { date: '20260922' });
+    assert.equal(n1.status, 200);
+    assert.equal(n1.json.value.name, 'XCC-Deluxe-20260922');
+    assert.equal(n1.json.value.number, undefined);
+
+    // 2. release without zip
+    const r1 = await call('releaseStart', { date: '20260922', zip: false });
+    assert.equal(r1.status, 200);
+    const job1 = await waitJob('releasePoll', r1.json.value.jobId);
+    assert.equal(job1.stage, 'done');
+    assert.equal(job1.error, undefined);
+    assert.equal(job1.result.dir, path.join(fake.saved, 'XCC-Deluxe-20260922'));
+    const copiedExe = await fs.readFile(path.join(fake.saved, 'XCC-Deluxe-20260922', 'XCC.exe'), 'utf8');
+    assert.equal(copiedExe, 'fake exe');
+
+    // 3. next after plain → -1
+    const n2 = await call('nextName', { date: '20260922' });
+    assert.equal(n2.json.value.name, 'XCC-Deluxe-20260922-1');
+
+    // 4. release with zip → zip has the release folder as its top entry
+    const r2 = await call('releaseStart', { date: '20260922', zip: true });
+    assert.equal(r2.status, 200);
+    const job2 = await waitJob('releasePoll', r2.json.value.jobId, 60000);
+    assert.equal(job2.stage, 'done');
+    assert.equal(job2.result.zip, path.join(fake.saved, 'XCC-Deluxe-20260922-1.zip'));
+    const entries = await new Promise((resolve, reject) => {
+      const out = [];
+      const child = spawn('tar.exe', ['-tf', job2.result.zip], { windowsHide: true });
+      child.stdout.on('data', (c) => out.push(c.toString('utf8')));
+      child.on('error', reject);
+      child.on('close', (code) => code === 0 ? resolve(out.join('').split(/\r?\n/).filter(Boolean)) : reject(new Error(`tar exit ${code}`)));
+    });
+    assert.ok(entries.every((e) => e.startsWith('XCC-Deluxe-20260922-1/')), `zip entries should be under the release folder, got: ${entries.slice(0, 5).join(', ')}`);
+
+    // 5. manual number collision → 409
+    const coll = await call('releaseStart', { date: '20260922', number: 1, zip: false });
+    assert.equal(coll.status, 409);
+
+    // 6. next after -1 → -2
+    const n3 = await call('nextName', { date: '20260922' });
+    assert.equal(n3.json.value.name, 'XCC-Deluxe-20260922-2');
+  } finally {
+    CURRENT_CWD = process.cwd();
+    await fs.rm(fake.root, { recursive: true, force: true });
+  }
+});
+
+test('pack/webBuild jobs surface script errors (fake project, no scripts)', async () => {
+  const fake = await makeFakeProject();
+  try {
+    CURRENT_CWD = fake.proj;
+    const p = await call('packStart', { buildConfig: 'Development' });
+    assert.equal(p.status, 200);
+    const pj = await waitJob('packPoll', p.json.value.jobId, 30000);
+    assert.notEqual(pj.exitCode, 0);
+    assert.ok(pj.error, 'pack job should report an error (package.ps1 missing)');
+
+    const w = await call('webBuildStart', { mode: 'dev' });
+    assert.equal(w.status, 200);
+    const wj = await waitJob('webBuildPoll', w.json.value.jobId, 30000);
+    assert.notEqual(wj.exitCode, 0);
+    assert.ok(wj.error, 'webBuild job should report an error (copy-dist-dev.ps1 missing)');
+
+    // invalid mode → 400
+    const bad = await call('webBuildStart', { mode: 'nope' });
+    assert.equal(bad.status, 400);
+  } finally {
+    CURRENT_CWD = process.cwd();
+    await fs.rm(fake.root, { recursive: true, force: true });
+  }
+});
+
+test('read-only root against the REAL project', async () => {
+  if (!(await fs.access(REAL_PROJECT).then(() => true).catch(() => false))) {
+    console.log('real project not found — skipping');
+    return;
+  }
+  try {
+    CURRENT_CWD = REAL_PROJECT;
+    const root = await call('root', {});
+    assert.equal(root.status, 200);
+    const v = root.json.value;
+    assert.equal(v.projectRoot, REAL_PROJECT);
+    assert.equal(v.hasBuild, true);
+    assert.ok(v.releases.length >= 1, 'real Saved should contain releases');
+    assert.ok(v.releases.every((r) => /^XCC-Deluxe-\d{8}(?:-\d+)?$/.test(r.name)));
+    const today = v.now;
+    const n = await call('nextName', { date: today });
+    assert.equal(n.status, 200);
+    assert.ok(/^XCC-Deluxe-\d{8}(?:-\d+)?$/.test(n.json.value.name));
+    console.log(`real project: releases=${v.releases.length}, next=${n.json.value.name}, ueDir=${v.ueDir || '(not resolved)'}`);
+  } finally {
+    CURRENT_CWD = process.cwd();
+  }
+});
+
+console.log(`plugin root: ${PLUGIN_ROOT}`);
