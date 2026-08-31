@@ -345,6 +345,7 @@ test('upload: latestZip matching, remote path validation, fake bdpan flow', asyn
     const up = await call('uploadStart', { remoteDir: 'XCC-Deluxe/' });
     assert.equal(up.status, 200);
     assert.equal(up.json.value.remote, 'XCC-Deluxe/XCC-Deluxe-20260928-1.zip');
+    assert.equal(up.json.value.size, 2); // 'z2' content
     const upJob = await waitJob('uploadPoll', up.json.value.jobId, 30000);
     assert.notEqual(upJob.exitCode, 0);
     assert.ok(upJob.error, 'fake bdpan should make the upload job fail');
