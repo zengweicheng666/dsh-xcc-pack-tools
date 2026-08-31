@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseReleaseName, localDateStamp, computeReleaseName, scanReleases, decodeLine } from '../lib/pure.js';
+import { parseReleaseName, localDateStamp, computeReleaseName, scanReleases, decodeLine, parseWebVersion, bumpWebVersion, versionText } from '../lib/pure.js';
 
 test('parseReleaseName', () => {
   assert.deepEqual(parseReleaseName('XCC-Deluxe-20260922'), { date: '20260922', number: undefined });
@@ -130,4 +130,26 @@ test('decodeLine: utf8 passthrough and gbk fallback', () => {
   const decoded = decodeLine(gbk);
   assert.ok(!decoded.includes('\uFFFD'));
   assert.equal(decoded, '打包完成');
+});
+
+test('parseWebVersion', () => {
+  assert.deepEqual(parseWebVersion('{"major":1,"minor":2,"patch":3}'), { major: 1, minor: 2, patch: 3 });
+  assert.deepEqual(parseWebVersion('{"major":0,"minor":0,"patch":0}'), { major: 0, minor: 0, patch: 0 });
+  assert.equal(parseWebVersion('not json'), null);
+  assert.equal(parseWebVersion('{"major":1,"minor":2}'), null);      // missing patch
+  assert.equal(parseWebVersion('{"major":"x","minor":2,"patch":3}'), null);
+  assert.equal(parseWebVersion(''), null);
+  assert.equal(parseWebVersion(null), null);
+});
+
+test('bumpWebVersion: mirrors copy-dist-common.ps1 rollover rules', () => {
+  assert.deepEqual(bumpWebVersion({ major: 1, minor: 2, patch: 3 }), { major: 1, minor: 2, patch: 4 });
+  assert.deepEqual(bumpWebVersion({ major: 1, minor: 2, patch: 999 }), { major: 1, minor: 3, patch: 1 });
+  assert.deepEqual(bumpWebVersion({ major: 1, minor: 99, patch: 999 }), { major: 2, minor: 1, patch: 1 });
+  assert.deepEqual(bumpWebVersion({ major: 0, minor: 0, patch: 0 }), { major: 0, minor: 0, patch: 1 });
+});
+
+test('versionText', () => {
+  assert.equal(versionText({ major: 1, minor: 2, patch: 3 }), 'v1.2.3');
+  assert.equal(versionText(null), '');
 });

@@ -98,6 +98,7 @@ async function makeFakeProject() {
   await fs.writeFile(path.join(win, 'Manifest_UFSFiles_Win64.txt'), 'm');
   await fs.writeFile(path.join(win, 'XCC', 'HTML', 'dist', 'index.html'), '<html>fake</html>');
   await fs.writeFile(path.join(win, 'Engine', 'Binaries', 'dummy.dll'), 'dll');
+  await fs.writeFile(path.join(proj, 'Web', 'version.json'), '{"major":1,"minor":2,"patch":3}');
   // pre-existing release from a previous day
   await fs.mkdir(path.join(saved, 'XCC-Deluxe-20260921'), { recursive: true });
   await fs.writeFile(path.join(saved, 'XCC-Deluxe-20260921', 'XCC.exe'), 'old');
@@ -124,6 +125,7 @@ test('root + nextName + release flow on a fake project', async () => {
     assert.equal(root.json.value.projectRoot, fake.proj);
     assert.equal(root.json.value.outputDir, fake.win);
     assert.equal(root.json.value.hasBuild, true);
+    assert.deepEqual(root.json.value.webVersion, { current: 'v1.2.3', next: 'v1.2.4' });
     const names = root.json.value.releases.map((r) => r.name);
     assert.deepEqual(names, ['XCC-Deluxe-20260921']);
 
@@ -257,6 +259,7 @@ test('read-only root against the REAL project', async () => {
     const v = root.json.value;
     assert.equal(v.projectRoot, REAL_PROJECT);
     assert.equal(v.hasBuild, true);
+    assert.ok(v.webVersion && /^v\d+\.\d+\.\d+$/.test(v.webVersion.current), `webVersion.current should be vX.Y.Z, got ${v.webVersion?.current}`);
     assert.ok(v.releases.length >= 1, 'real Saved should contain releases');
     assert.ok(v.releases.every((r) => /^XCC-Deluxe-\d{8}(?:-\d+)?$/.test(r.name)));
     const today = v.now;
