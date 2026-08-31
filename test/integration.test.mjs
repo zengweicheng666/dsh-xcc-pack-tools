@@ -115,6 +115,17 @@ test('plugin applies: route + 4 agent tools registered', () => {
   }
 });
 
+async function zipEntries(zipPath) {
+  const out = [];
+  const child = spawn('tar.exe', ['-tf', zipPath], { windowsHide: true });
+  child.stdout.on('data', (c) => out.push(c.toString('utf8')));
+  await new Promise((resolve, reject) => {
+    child.on('error', reject);
+    child.on('close', (code) => code === 0 ? resolve() : reject(new Error(`tar exit ${code}`)));
+  });
+  return out.join('').split(/\r?\n/).filter(Boolean);
+}
+
 test('root + nextName + release flow on a fake project', async () => {
   const fake = await makeFakeProject();
   try {
@@ -126,6 +137,8 @@ test('root + nextName + release flow on a fake project', async () => {
     assert.equal(root.json.value.outputDir, fake.win);
     assert.equal(root.json.value.hasBuild, true);
     assert.deepEqual(root.json.value.webVersion, { current: 'v1.2.3', next: 'v1.2.4' });
+    assert.ok(['7z', 'dotnet'].includes(root.json.value.zipTool), `zipTool should be 7z|dotnet, got ${root.json.value.zipTool}`);
+    if (root.json.value.zipTool === '7z') assert.ok(root.json.value.sevenZip, 'sevenZip path should be reported when 7z is the tool');
     const names = root.json.value.releases.map((r) => r.name);
     assert.deepEqual(names, ['XCC-Deluxe-20260921']);
 
@@ -149,19 +162,14 @@ test('root + nextName + release flow on a fake project', async () => {
     const n2 = await call('nextName', { date: '20260922' });
     assert.equal(n2.json.value.name, 'XCC-Deluxe-20260922-1');
 
-    // 4. release with zip → zip has the release folder as its top entry
+    // 4. release with zip (auto tool) → zip has the release folder as its top entry
     const r2 = await call('releaseStart', { date: '20260922', zip: true });
     assert.equal(r2.status, 200);
     const job2 = await waitJob('releasePoll', r2.json.value.jobId, 60000);
     assert.equal(job2.stage, 'done');
     assert.equal(job2.result.zip, path.join(fake.saved, 'XCC-Deluxe-20260922-1.zip'));
-    const entries = await new Promise((resolve, reject) => {
-      const out = [];
-      const child = spawn('tar.exe', ['-tf', job2.result.zip], { windowsHide: true });
-      child.stdout.on('data', (c) => out.push(c.toString('utf8')));
-      child.on('error', reject);
-      child.on('close', (code) => code === 0 ? resolve(out.join('').split(/\r?\n/).filter(Boolean)) : reject(new Error(`tar exit ${code}`)));
-    });
+    assert.ok(['7z', 'dotnet'].includes(job2.result.zipTool));
+    const entries = await zipEntries(job2.result.zip);
     assert.ok(entries.every((e) => e.startsWith('XCC-Deluxe-20260922-1/')), `zip entries should be under the release folder, got: ${entries.slice(0, 5).join(', ')}`);
 
     // 5. manual number collision → 409
@@ -171,6 +179,48 @@ test('root + nextName + release flow on a fake project', async () => {
     // 6. next after -1 → -2
     const n3 = await call('nextName', { date: '20260922' });
     assert.equal(n3.json.value.name, 'XCC-Deluxe-20260922-2');
+  } finally {
+    CURRENT_CWD = process.cwd();
+    await fs.rm(fake.root, { recursive: true, force: true });
+  }
+});
+
+test('release zip tool selection: explicit dotnet, explicit 7z, invalid', async () => {
+  const fake = await makeFakeProject();
+  try {
+    CURRENT_CWD = fake.proj;
+    const root = await call('root', {});
+    const sevenZipAvailable = root.json.value.zipTool === '7z';
+
+    // explicit dotnet → deterministic .NET path
+    const r = await call('releaseStart', { date: '20260923', zipTool: 'dotnet' });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.value.zipTool, 'dotnet');
+    const job = await waitJob('releasePoll', r.json.value.jobId, 60000);
+    assert.equal(job.stage, 'done');
+    assert.equal(job.error, undefined);
+    assert.equal(job.result.zipTool, 'dotnet');
+    const e1 = await zipEntries(job.result.zip);
+    assert.ok(e1.every((x) => x.startsWith('XCC-Deluxe-20260923/')), `dotnet zip entries under folder, got: ${e1.slice(0, 3).join(', ')}`);
+
+    // explicit 7z → succeeds when 7-Zip is installed, else 409
+    const r2 = await call('releaseStart', { date: '20260924', zipTool: '7z' });
+    if (sevenZipAvailable) {
+      assert.equal(r2.status, 200);
+      assert.equal(r2.json.value.zipTool, '7z');
+      const job2 = await waitJob('releasePoll', r2.json.value.jobId, 60000);
+      assert.equal(job2.stage, 'done');
+      assert.equal(job2.error, undefined);
+      assert.equal(job2.result.zipTool, '7z');
+      const e2 = await zipEntries(job2.result.zip);
+      assert.ok(e2.every((x) => x.startsWith('XCC-Deluxe-20260924/')), `7z zip entries under folder, got: ${e2.slice(0, 3).join(', ')}`);
+    } else {
+      assert.equal(r2.status, 409);
+    }
+
+    // invalid zipTool → 400
+    const bad = await call('releaseStart', { date: '20260925', zipTool: 'rar' });
+    assert.equal(bad.status, 400);
   } finally {
     CURRENT_CWD = process.cwd();
     await fs.rm(fake.root, { recursive: true, force: true });
