@@ -20,6 +20,18 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, '..');
 const REAL_PROJECT = 'D:\\Work\\HoloX\\XCC-Deluxe';
 
+// Inject a FAKE bdpan CLI (a where.exe copy) via BDPAN_BIN so upload tests
+// are deterministic regardless of whether the machine has bdpan installed.
+const FAKE_BDPAN = path.join(os.tmpdir(), `dsh-pack-test-bdpan-${process.pid}.exe`);
+await fs.copyFile(
+  path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'where.exe'),
+  FAKE_BDPAN,
+);
+process.env.BDPAN_BIN = FAKE_BDPAN;
+process.on('exit', () => {
+  try { fs.rmSync(FAKE_BDPAN, { force: true }); } catch { /* best effort */ }
+});
+
 let route = null;
 const registeredTools = [];
 const ctx = {
@@ -306,14 +318,16 @@ test('run API: launch build exe, validate targets', async () => {
     rmForce(fake.root);
   }
 });
-test('upload: latestZip matching, remote path validation, bdpan-missing handling', async () => {
+test('upload: latestZip matching, remote path validation, fake bdpan flow', async () => {
   const fake = await makeFakeProject();
   try {
     CURRENT_CWD = fake.proj;
-    // fake environment has no bdpan CLI → status reports it
+    // fake bdpan is "installed" via BDPAN_BIN but not logged in
     const st = await call('bdpanStatus', {});
     assert.equal(st.status, 200);
-    assert.equal(st.json.value.installed, false);
+    assert.equal(st.json.value.installed, true);
+    assert.equal(st.json.value.binPath, FAKE_BDPAN);
+    assert.equal(st.json.value.loggedIn, false);
 
     // create release zips: latest = XCC-Deluxe-20260928-1.zip
     await fs.writeFile(path.join(fake.saved, 'XCC-Deluxe-20260927.zip'), 'z1');
@@ -325,12 +339,23 @@ test('upload: latestZip matching, remote path validation, bdpan-missing handling
     assert.equal(root.json.value.latestZip.isDir, false);
     assert.equal(root.json.value.latestZip.path, path.join(fake.saved, 'XCC-Deluxe-20260928-1.zip'));
 
-    // upload without bdpan → 409 with install hint (bdpan gate runs before path validation)
+    // valid upload: gate passes (fake bdpan "installed"), job starts and
+    // fails at the CLI level — plumbing (path resolution, remote name, job)
+    // is what we assert here
     const up = await call('uploadStart', { remoteDir: 'XCC-Deluxe/' });
-    assert.equal(up.status, 409);
-    assert.ok(up.json.error.message.includes('bdpan'), up.json.error.message);
+    assert.equal(up.status, 200);
+    assert.equal(up.json.value.remote, 'XCC-Deluxe/XCC-Deluxe-20260928-1.zip');
+    const upJob = await waitJob('uploadPoll', up.json.value.jobId, 30000);
+    assert.notEqual(upJob.exitCode, 0);
+    assert.ok(upJob.error, 'fake bdpan should make the upload job fail');
+
+    // traversal remote dir → 400 (bdpan gate passes, path validation rejects)
     const bad = await call('uploadStart', { remoteDir: '../evil/' });
-    assert.equal(bad.status, 409);
+    assert.equal(bad.status, 400);
+
+    // explicit local file that does not exist → 400
+    const miss = await call('uploadStart', { remoteDir: 'XCC-Deluxe/', localPath: 'nope.zip' });
+    assert.equal(miss.status, 400);
 
     // settings roundtrip (restore afterwards)
     const before = await call('settingsGet', {});
