@@ -371,6 +371,12 @@ test('upload: latestZip matching, remote path validation, fake bdpan flow', asyn
     } finally {
       await call('settingsSet', { bdpanRemoteDir: oldVal ?? '' });
     }
+
+    // activeJobs: shape check (no jobs should be running at this point)
+    const act = await call('activeJobs', {});
+    assert.equal(act.status, 200);
+    assert.ok(Array.isArray(act.json.value.jobs));
+    assert.ok(act.json.value.jobs.every((j) => j.jobId && typeof j.kind === 'string'));
   } finally {
     CURRENT_CWD = process.cwd();
     rmForce(fake.root);
