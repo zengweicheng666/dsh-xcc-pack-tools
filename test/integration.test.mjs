@@ -200,6 +200,51 @@ test('pack/webBuild jobs surface script errors (fake project, no scripts)', asyn
   }
 });
 
+test('run API: launch build exe, validate targets', async () => {
+  const fake = await makeFakeProject();
+  try {
+    CURRENT_CWD = fake.proj;
+    // replace the placeholder with a REAL runnable exe (where.exe exits instantly)
+    const whereExe = path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'where.exe');
+    await fs.copyFile(whereExe, path.join(fake.win, 'XCC.exe'));
+
+    const ok = await call('run', { target: 'build' });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.json.value.started, true);
+    assert.equal(ok.json.value.exe, path.join(fake.win, 'XCC.exe'));
+    assert.ok(Number.isInteger(ok.json.value.pid) && ok.json.value.pid > 0);
+
+    // bad target → 400
+    const badTarget = await call('run', { target: 'nope' });
+    assert.equal(badTarget.status, 400);
+
+    // traversal attempt → 400 (name regex rejects slashes)
+    const trav = await call('run', { target: 'release', name: '..\\..\\foo' });
+    assert.equal(trav.status, 400);
+
+    // release folder without an exe → 409
+    await fs.mkdir(path.join(fake.saved, 'XCC-Deluxe-20260919'), { recursive: true });
+    const missing = await call('run', { target: 'release', name: 'XCC-Deluxe-20260919' });
+    assert.equal(missing.status, 409);
+
+    // release folder with a REAL exe → starts
+    await fs.mkdir(path.join(fake.saved, 'XCC-Deluxe-20260920'), { recursive: true });
+    await fs.copyFile(whereExe, path.join(fake.saved, 'XCC-Deluxe-20260920', 'XCC.exe'));
+    const rel = await call('run', { target: 'release', name: 'XCC-Deluxe-20260920' });
+    assert.equal(rel.status, 200);
+    assert.equal(rel.json.value.started, true);
+
+    // invalid exe (text file) → 500 with error message
+    await fs.writeFile(path.join(fake.win, 'XCC.exe'), 'not an exe');
+    const bad = await call('run', { target: 'build' });
+    assert.equal(bad.status, 500);
+    assert.ok(bad.json.error && bad.json.error.message);
+  } finally {
+    CURRENT_CWD = process.cwd();
+    await fs.rm(fake.root, { recursive: true, force: true });
+  }
+});
+
 test('read-only root against the REAL project', async () => {
   if (!(await fs.access(REAL_PROJECT).then(() => true).catch(() => false))) {
     console.log('real project not found — skipping');
