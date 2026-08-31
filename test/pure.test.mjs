@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseReleaseName, localDateStamp, computeReleaseName, scanReleases, decodeLine, parseWebVersion, bumpWebVersion, versionText } from '../lib/pure.js';
+import { parseReleaseName, localDateStamp, computeReleaseName, scanReleases, decodeLine, parseWebVersion, bumpWebVersion, versionText, resolveRemotePath } from '../lib/pure.js';
 
 test('parseReleaseName', () => {
   assert.deepEqual(parseReleaseName('XCC-Deluxe-20260922'), { date: '20260922', number: undefined });
@@ -152,4 +152,26 @@ test('bumpWebVersion: mirrors copy-dist-common.ps1 rollover rules', () => {
 test('versionText', () => {
   assert.equal(versionText({ major: 1, minor: 2, patch: 3 }), 'v1.2.3');
   assert.equal(versionText(null), '');
+});
+
+test('resolveRemotePath: appends the zip name to a directory', () => {
+  assert.equal(resolveRemotePath('XCC-Deluxe/', 'XCC-Deluxe-20260901.zip'), 'XCC-Deluxe/XCC-Deluxe-20260901.zip');
+  assert.equal(resolveRemotePath('XCC-Deluxe', 'x.zip'), 'XCC-Deluxe/x.zip');
+  assert.equal(resolveRemotePath('a/b/c/', 'x.zip'), 'a/b/c/x.zip');
+});
+
+test('resolveRemotePath: full file path passes through', () => {
+  assert.equal(resolveRemotePath('backup/x.zip', 'x.zip'), 'backup/x.zip');
+  assert.equal(resolveRemotePath('XCC-Deluxe-20260901.ZIP', 'y.zip'), 'XCC-Deluxe-20260901.ZIP'); // case-insensitive .zip
+});
+
+test('resolveRemotePath: rejects traversal and weird input', () => {
+  assert.throws(() => resolveRemotePath('', 'x.zip'), /请填写/);
+  assert.throws(() => resolveRemotePath('   ', 'x.zip'), /请填写/);
+  assert.throws(() => resolveRemotePath('../foo', 'x.zip'), /不合法/);
+  assert.throws(() => resolveRemotePath('a/../b', 'x.zip'), /不合法/);
+  assert.throws(() => resolveRemotePath('a\\b', 'x.zip'), /不合法/);
+  assert.throws(() => resolveRemotePath('~foo', 'x.zip'), /不合法/);
+  assert.throws(() => resolveRemotePath('/apps/bdpan/', 'x.zip'), /不合法/);
+  assert.throws(() => resolveRemotePath('XCC-Deluxe/..', 'x.zip'), /不合法/);
 });

@@ -126,6 +126,19 @@ async function zipEntries(zipPath) {
   return out.join('').split(/\r?\n/).filter(Boolean);
 }
 
+/** Recursive rm with retries (spawned children may briefly hold cwd handles). */
+async function rmForce(dir) {
+  for (let i = 0; i < 6; i++) {
+    try {
+      await fs.rm(dir, { recursive: true, force: true });
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  }
+  await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+}
+
 test('root + nextName + release flow on a fake project', async () => {
   const fake = await makeFakeProject();
   try {
@@ -181,10 +194,9 @@ test('root + nextName + release flow on a fake project', async () => {
     assert.equal(n3.json.value.name, 'XCC-Deluxe-20260922-2');
   } finally {
     CURRENT_CWD = process.cwd();
-    await fs.rm(fake.root, { recursive: true, force: true });
+    rmForce(fake.root);
   }
 });
-
 test('release zip tool selection: explicit dotnet, explicit 7z, invalid', async () => {
   const fake = await makeFakeProject();
   try {
@@ -223,10 +235,9 @@ test('release zip tool selection: explicit dotnet, explicit 7z, invalid', async 
     assert.equal(bad.status, 400);
   } finally {
     CURRENT_CWD = process.cwd();
-    await fs.rm(fake.root, { recursive: true, force: true });
+    rmForce(fake.root);
   }
 });
-
 test('pack/webBuild jobs surface script errors (fake project, no scripts)', async () => {
   const fake = await makeFakeProject();
   try {
@@ -248,10 +259,9 @@ test('pack/webBuild jobs surface script errors (fake project, no scripts)', asyn
     assert.equal(bad.status, 400);
   } finally {
     CURRENT_CWD = process.cwd();
-    await fs.rm(fake.root, { recursive: true, force: true });
+    rmForce(fake.root);
   }
 });
-
 test('run API: launch build exe, validate targets', async () => {
   const fake = await makeFakeProject();
   try {
@@ -293,10 +303,53 @@ test('run API: launch build exe, validate targets', async () => {
     assert.ok(bad.json.error && bad.json.error.message);
   } finally {
     CURRENT_CWD = process.cwd();
-    await fs.rm(fake.root, { recursive: true, force: true });
+    rmForce(fake.root);
   }
 });
+test('upload: latestZip matching, remote path validation, bdpan-missing handling', async () => {
+  const fake = await makeFakeProject();
+  try {
+    CURRENT_CWD = fake.proj;
+    // fake environment has no bdpan CLI → status reports it
+    const st = await call('bdpanStatus', {});
+    assert.equal(st.status, 200);
+    assert.equal(st.json.value.installed, false);
 
+    // create release zips: latest = XCC-Deluxe-20260928-1.zip
+    await fs.writeFile(path.join(fake.saved, 'XCC-Deluxe-20260927.zip'), 'z1');
+    await fs.writeFile(path.join(fake.saved, 'XCC-Deluxe-20260928-1.zip'), 'z2');
+
+    const root = await call('root', {});
+    assert.equal(root.status, 200);
+    assert.equal(root.json.value.latestZip.name, 'XCC-Deluxe-20260928-1');
+    assert.equal(root.json.value.latestZip.isDir, false);
+    assert.equal(root.json.value.latestZip.path, path.join(fake.saved, 'XCC-Deluxe-20260928-1.zip'));
+
+    // upload without bdpan → 409 with install hint (bdpan gate runs before path validation)
+    const up = await call('uploadStart', { remoteDir: 'XCC-Deluxe/' });
+    assert.equal(up.status, 409);
+    assert.ok(up.json.error.message.includes('bdpan'), up.json.error.message);
+    const bad = await call('uploadStart', { remoteDir: '../evil/' });
+    assert.equal(bad.status, 409);
+
+    // settings roundtrip (restore afterwards)
+    const before = await call('settingsGet', {});
+    assert.equal(before.status, 200);
+    const oldVal = before.json.value.settings.bdpanRemoteDir;
+    try {
+      const set = await call('settingsSet', { bdpanRemoteDir: 'XCC-Deluxe/测试' });
+      assert.equal(set.status, 200);
+      assert.equal(set.json.value.settings.bdpanRemoteDir, 'XCC-Deluxe/测试');
+      const get = await call('settingsGet', {});
+      assert.equal(get.json.value.settings.bdpanRemoteDir, 'XCC-Deluxe/测试');
+    } finally {
+      await call('settingsSet', { bdpanRemoteDir: oldVal ?? '' });
+    }
+  } finally {
+    CURRENT_CWD = process.cwd();
+    rmForce(fake.root);
+  }
+});
 test('read-only root against the REAL project', async () => {
   if (!(await fs.access(REAL_PROJECT).then(() => true).catch(() => false))) {
     console.log('real project not found — skipping');
