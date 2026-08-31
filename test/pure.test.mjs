@@ -165,13 +165,21 @@ test('resolveRemotePath: full file path passes through', () => {
   assert.equal(resolveRemotePath('XCC-Deluxe-20260901.ZIP', 'y.zip'), 'XCC-Deluxe-20260901.ZIP'); // case-insensitive .zip
 });
 
-test('resolveRemotePath: rejects traversal and weird input', () => {
+test('resolveRemotePath: backslashes are normalized to slashes', () => {
+  assert.equal(resolveRemotePath('XCC-Deluxe\\2026', 'x.zip'), 'XCC-Deluxe/2026/x.zip');
+  assert.equal(resolveRemotePath('XCC-Deluxe\\2026\\', 'x.zip'), 'XCC-Deluxe/2026/x.zip');
+  assert.equal(resolveRemotePath('a\\b\\c.zip', 'x.zip'), 'a/b/c.zip');
+  assert.equal(resolveRemotePath(' XCC-Deluxe\\2026 ', 'x.zip'), 'XCC-Deluxe/2026/x.zip'); // trims whitespace
+});
+
+test('resolveRemotePath: rejects traversal, drive letters and weird input', () => {
   assert.throws(() => resolveRemotePath('', 'x.zip'), /请填写/);
   assert.throws(() => resolveRemotePath('   ', 'x.zip'), /请填写/);
-  assert.throws(() => resolveRemotePath('../foo', 'x.zip'), /不合法/);
-  assert.throws(() => resolveRemotePath('a/../b', 'x.zip'), /不合法/);
-  assert.throws(() => resolveRemotePath('a\\b', 'x.zip'), /不合法/);
-  assert.throws(() => resolveRemotePath('~foo', 'x.zip'), /不合法/);
-  assert.throws(() => resolveRemotePath('/apps/bdpan/', 'x.zip'), /不合法/);
-  assert.throws(() => resolveRemotePath('XCC-Deluxe/..', 'x.zip'), /不合法/);
+  assert.throws(() => resolveRemotePath('../foo', 'x.zip'), /\.\./);
+  assert.throws(() => resolveRemotePath('a/../b', 'x.zip'), /\.\./);
+  assert.throws(() => resolveRemotePath('XCC-Deluxe/..', 'x.zip'), /\.\./);
+  assert.throws(() => resolveRemotePath('~foo', 'x.zip'), /~/);
+  assert.throws(() => resolveRemotePath('/apps/bdpan/', 'x.zip'), /\/ 开头/);
+  assert.throws(() => resolveRemotePath('D:\\foo', 'x.zip'), /盘符/);
+  assert.throws(() => resolveRemotePath('C:/bar', 'x.zip'), /盘符/);
 });
