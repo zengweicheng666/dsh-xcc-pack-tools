@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseReleaseName, localDateStamp, computeReleaseName, scanReleases, decodeLine, parseWebVersion, bumpWebVersion, versionText, resolveRemotePath } from '../lib/pure.js';
+import { parseReleaseName, localDateStamp, computeReleaseName, scanReleases, decodeLine, parseWebVersion, bumpWebVersion, versionText, resolveRemotePath, parseUproject, isVersionAssociation, ueVersionKey, parseLauncherInstalled } from '../lib/pure.js';
 
 test('parseReleaseName', () => {
   assert.deepEqual(parseReleaseName('XCC-Deluxe-20260922'), { date: '20260922', number: undefined });
@@ -182,4 +182,64 @@ test('resolveRemotePath: rejects traversal, drive letters and weird input', () =
   assert.throws(() => resolveRemotePath('/apps/bdpan/', 'x.zip'), /\/ 开头/);
   assert.throws(() => resolveRemotePath('D:\\foo', 'x.zip'), /盘符/);
   assert.throws(() => resolveRemotePath('C:/bar', 'x.zip'), /盘符/);
+});
+
+test('parseUproject: engine association extraction', () => {
+  assert.deepEqual(parseUproject('{\n\t"FileVersion": 3,\n\t"EngineAssociation": "5.7"\n}'), { engineAssociation: '5.7' });
+  assert.deepEqual(parseUproject('\uFEFF{"EngineAssociation":"5.7"}'), { engineAssociation: '5.7' }); // BOM
+  assert.deepEqual(parseUproject('{"EngineAssociation": "5.7", "Modules": []}'), { engineAssociation: '5.7' });
+  assert.equal(parseUproject('{"FileVersion":3}'), null);                       // no association
+  assert.equal(parseUproject('{"EngineAssociation": ""}'), null);               // empty association
+  assert.equal(parseUproject('not json'), null);
+  assert.equal(parseUproject(''), null);
+  assert.equal(parseUproject(null), null);
+  // source-build GUID association is still returned verbatim (caller decides)
+  assert.deepEqual(parseUproject('{"EngineAssociation":"{ABC12345-0000-1111-2222-333344445555}"}'),
+    { engineAssociation: '{ABC12345-0000-1111-2222-333344445555}' });
+});
+
+test('isVersionAssociation / ueVersionKey', () => {
+  assert.equal(isVersionAssociation('5.7'), true);
+  assert.equal(isVersionAssociation('4.27'), true);
+  assert.equal(isVersionAssociation('5.7.1'), true);
+  assert.equal(isVersionAssociation(' 5.7 '), true);      // trimmed
+  assert.equal(isVersionAssociation('UE_5.7'), false);
+  assert.equal(isVersionAssociation('{ABC12345-0000-1111-2222-333344445555}'), false);
+  assert.equal(isVersionAssociation('5'), false);
+  assert.equal(isVersionAssociation('5.x'), false);
+  assert.equal(isVersionAssociation(''), false);
+  assert.equal(isVersionAssociation(null), false);
+
+  assert.equal(ueVersionKey('5.7'), 'UE_5.7');
+  assert.equal(ueVersionKey('4.27'), 'UE_4.27');
+  assert.equal(ueVersionKey('5.7.1'), 'UE_5.7.1');
+  assert.equal(ueVersionKey('{ABC12345-0000-1111-2222-333344445555}'), null);
+  assert.equal(ueVersionKey(null), null);
+});
+
+test('parseLauncherInstalled: engine entries only, deduped', () => {
+  const raw = JSON.stringify({
+    InstallationList: [
+      { AppName: 'UE_5.7', InstallLocation: 'D:\\EpicLib\\UE_5.7', ArtifactId: 'UE_5.7' },
+      { AppName: 'UE_5.2', InstallLocation: 'D:\\EpicLib\\UE_5.2', ArtifactId: 'UE_5.2' },
+      { AppName: 'FabPlugin_5.7', InstallLocation: 'D:\\EpicLib\\UE_5.7', ArtifactId: 'FabPlugin_5.7' },  // plugin — ignored
+      { AppName: 'QuixelBridge_5.7', InstallLocation: 'D:\\EpicLib\\UE_5.7', ArtifactId: 'x' },           // plugin — ignored
+      { AppName: 'UE_5.7', InstallLocation: 'D:\\EpicLib\\UE_5.7', ArtifactId: 'ue' },                    // engine dupe — dropped
+      { AppName: 'UE_4.27', InstallLocation: 'D:\\EpicLib\\UE_4.27' },
+      { AppName: 'BlueprintAssist_5.2', InstallLocation: 'D:\\EpicLib\\UE_5.2' },                          // plugin — ignored
+    ],
+  });
+  assert.deepEqual(parseLauncherInstalled(raw), [
+    { version: '5.7', dir: 'D:\\EpicLib\\UE_5.7' },
+    { version: '5.2', dir: 'D:\\EpicLib\\UE_5.2' },
+    { version: '4.27', dir: 'D:\\EpicLib\\UE_4.27' },
+  ]);
+});
+
+test('parseLauncherInstalled: junk input yields empty list', () => {
+  assert.deepEqual(parseLauncherInstalled(''), []);
+  assert.deepEqual(parseLauncherInstalled('not json'), []);
+  assert.deepEqual(parseLauncherInstalled('{"InstallationList": null}'), []);
+  assert.deepEqual(parseLauncherInstalled('{"InstallationList": [{"AppName": "UE_5.7"}]}'), []); // no dir
+  assert.deepEqual(parseLauncherInstalled(null), []);
 });

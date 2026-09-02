@@ -105,7 +105,7 @@ async function makeFakeProject() {
   await fs.mkdir(path.join(win, 'XCC', 'HTML', 'dist'), { recursive: true });
   await fs.mkdir(path.join(win, 'Engine', 'Binaries'), { recursive: true });
   await fs.mkdir(path.join(proj, 'Web'), { recursive: true });
-  await fs.writeFile(path.join(proj, 'XCC.uproject'), '{}');
+  await fs.writeFile(path.join(proj, 'XCC.uproject'), '{"EngineAssociation": "9.9"}');
   await fs.writeFile(path.join(win, 'XCC.exe'), 'fake exe');
   await fs.writeFile(path.join(win, 'Manifest_UFSFiles_Win64.txt'), 'm');
   await fs.writeFile(path.join(win, 'XCC', 'HTML', 'dist', 'index.html'), '<html>fake</html>');
@@ -125,6 +125,10 @@ test('plugin applies: route + 4 agent tools registered', () => {
   for (const n of ['xcc_pack', 'xcc_web_build', 'xcc_release', 'xcc_job']) {
     assert.ok(names.includes(n), `missing tool ${n}`);
   }
+  // xcc_pack must not expose the removed inline-Web-build switch anymore
+  const packTool = registeredTools.find((t) => t.name === 'xcc_pack');
+  assert.ok(packTool, 'xcc_pack tool registered');
+  assert.ok(!JSON.stringify(packTool).includes('skipWebBuild'), 'xcc_pack must not expose skipWebBuild');
 });
 
 async function zipEntries(zipPath) {
@@ -250,16 +254,32 @@ test('release zip tool selection: explicit dotnet, explicit 7z, invalid', async 
     rmForce(fake.root);
   }
 });
-test('pack/webBuild jobs surface script errors (fake project, no scripts)', async () => {
+test('packStart: engine gates reject synchronously when no engine can be resolved', async () => {
   const fake = await makeFakeProject();
   try {
     CURRENT_CWD = fake.proj;
+    // association 9.9 is not installed anywhere → 409 before a job exists
     const p = await call('packStart', { buildConfig: 'Development' });
-    assert.equal(p.status, 200);
-    const pj = await waitJob('packPoll', p.json.value.jobId, 30000);
-    assert.notEqual(pj.exitCode, 0);
-    assert.ok(pj.error, 'pack job should report an error (package.ps1 missing)');
+    assert.equal(p.status, 409);
+    assert.equal(p.json.error.code, 'engine-not-found');
+    assert.ok(p.json.error.message.includes('EngineAssociation'), p.json.error.message);
 
+    // explicit engine dir that is not a UE root → 409 with reason
+    const bad = await call('packStart', { ue5Dir: path.join(fake.proj, 'not-an-engine') });
+    assert.equal(bad.status, 409);
+
+    // no pack job may have been created by the sync rejections
+    const act = await call('activeJobs', {});
+    assert.ok(act.json.value.jobs.every((j) => j.kind !== 'pack'));
+  } finally {
+    CURRENT_CWD = process.cwd();
+    rmForce(fake.root);
+  }
+});
+test('webBuildStart still standalone: script error surfaces in the job (no engine needed)', async () => {
+  const fake = await makeFakeProject();
+  try {
+    CURRENT_CWD = fake.proj;
     const w = await call('webBuildStart', { mode: 'dev' });
     assert.equal(w.status, 200);
     const wj = await waitJob('webBuildPoll', w.json.value.jobId, 30000);
@@ -270,6 +290,120 @@ test('pack/webBuild jobs surface script errors (fake project, no scripts)', asyn
     const bad = await call('webBuildStart', { mode: 'nope' });
     assert.equal(bad.status, 400);
   } finally {
+    CURRENT_CWD = process.cwd();
+    rmForce(fake.root);
+  }
+});
+test('packEngineSet roundtrip + pack job over a saved fake engine root', async () => {
+  const fake = await makeFakeProject();
+  const engine = path.join(fake.root, 'FakeEngine');
+  await fs.mkdir(path.join(engine, 'Engine', 'Build', 'BatchFiles'), { recursive: true });
+  await fs.writeFile(path.join(engine, 'Engine', 'Build', 'BatchFiles', 'RunUAT.bat'),
+    '@echo off\r\necho FAKE-UAT-RAN\r\nexit /b 0\r\n');
+  try {
+    CURRENT_CWD = fake.proj;
+
+    // saving a non-engine dir → 409
+    const bad = await call('packEngineSet', { engineDir: path.join(fake.proj, 'tmp') });
+    assert.equal(bad.status, 409);
+
+    // root before saving: association parsed, no engine resolvable
+    let r = await call('root', {});
+    assert.equal(r.status, 200);
+    assert.equal(r.json.value.ueVersion, '9.9');
+    assert.equal(r.json.value.ueAssociation, '9.9');
+    assert.equal(r.json.value.ueDir, null);
+    assert.equal(r.json.value.ueSource, null);
+    assert.equal(r.json.value.ueSavedDir, null);
+    assert.ok(r.json.value.uproject.endsWith('XCC.uproject'));
+
+    // save → root resolves through the persisted path
+    const set = await call('packEngineSet', { engineDir: engine });
+    assert.equal(set.status, 200);
+    assert.equal(set.json.value.engineDir, engine);
+    r = await call('root', {});
+    assert.equal(r.json.value.ueDir, engine);
+    assert.equal(r.json.value.ueSource, 'saved');
+    assert.equal(r.json.value.ueSavedDir, engine);
+
+    // pack over the fake engine: UBT missing → -nocompile fallback; the fake
+    // RunUAT.bat echoes FAKE-UAT-RAN and exits 0 → job succeeds
+    const p = await call('packStart', { buildConfig: 'Development' });
+    assert.equal(p.status, 200);
+    const pj = await waitJob('packPoll', p.json.value.jobId, 30000);
+    assert.equal(pj.stage, 'done');
+    assert.equal(pj.error, undefined);
+    assert.equal(pj.exitCode, 0);
+    assert.equal(pj.result.outputDir, path.join(fake.proj, 'Saved', 'Windows'));
+    const joined = pj.lines.join('\n');
+    assert.ok(joined.includes('FAKE-UAT-RAN'), `UAT output should appear in the log: ${joined.slice(-400)}`);
+
+    // clearing the saved path → unresolvable again
+    const clr = await call('packEngineSet', { engineDir: '' });
+    assert.equal(clr.status, 200);
+    assert.equal(clr.json.value.engineDir, null);
+    r = await call('root', {});
+    assert.equal(r.json.value.ueDir, null);
+    assert.equal(r.json.value.ueSource, null);
+    assert.equal(r.json.value.ueSavedDir, null);
+  } finally {
+    // always remove the per-project engine path this test created
+    CURRENT_CWD = fake.proj;
+    await call('packEngineSet', { engineDir: '' }).catch(() => {});
+    // drop the now-empty enginePaths container if this test created it, so
+    // the user's real settings file stays untouched
+    try {
+      const sp = path.join(os.homedir(), '.dsh', 'dsh-xcc-pack-tools-settings.json');
+      const s = JSON.parse(await fs.readFile(sp, 'utf8'));
+      if (s.enginePaths && typeof s.enginePaths === 'object' && Object.keys(s.enginePaths).length === 0) {
+        delete s.enginePaths;
+        await fs.writeFile(sp, JSON.stringify(s, null, 2), 'utf8');
+      }
+    } catch { /* best effort */ }
+    CURRENT_CWD = process.cwd();
+    rmForce(fake.root);
+  }
+});
+test('pack compile step runs UBT when present (regression: never spawns the .uproject)', async () => {
+  const fake = await makeFakeProject();
+  const engine = path.join(fake.root, 'FakeEngine');
+  // Fake engine WITH a UBT exe (a where.exe copy — exits non-zero for our
+  // arg patterns, so the compile step must fail with the UBT exit code).
+  // This exercises the compile branch that the earlier fake-engine test
+  // skipped (UBT missing → -nocompile); before the arg-order fix the step
+  // spawned the .uproject path itself → "spawn ...XCC.uproject ENOENT".
+  await fs.mkdir(path.join(engine, 'Engine', 'Build', 'BatchFiles'), { recursive: true });
+  await fs.writeFile(path.join(engine, 'Engine', 'Build', 'BatchFiles', 'RunUAT.bat'),
+    '@echo off\r\necho FAKE-UAT-RAN\r\nexit /b 0\r\n');
+  const ubtDir = path.join(engine, 'Engine', 'Binaries', 'DotNET', 'UnrealBuildTool');
+  await fs.mkdir(ubtDir, { recursive: true });
+  await fs.copyFile(path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'where.exe'),
+    path.join(ubtDir, 'UnrealBuildTool.exe'));
+  try {
+    CURRENT_CWD = fake.proj;
+    await call('packEngineSet', { engineDir: engine });
+    // compile NOT skipped → UBT step runs first and must fail on its own
+    const p = await call('packStart', { buildConfig: 'Development' });
+    assert.equal(p.status, 200);
+    const pj = await waitJob('packPoll', p.json.value.jobId, 30000);
+    assert.ok(pj.done, 'job should finish');
+    assert.ok(pj.error, 'fake UBT exits non-zero → compile failure expected');
+    assert.ok(!pj.error.includes('ENOENT'), `must not spawn the uproject as a program: ${pj.error}`);
+    assert.ok(pj.error.includes('编译失败'), `error should be the UBT failure: ${pj.error}`);
+    const joined = pj.lines.join('\n');
+    assert.ok(joined.includes('UBT:'), 'compile step should log the UBT command line');
+    assert.ok(joined.includes('-Project='), 'UBT args should carry -Project=<uproject>');
+  } finally {
+    CURRENT_CWD = fake.proj;
+    await call('packEngineSet', { engineDir: '' }).catch(() => {});
+    try {
+      const sp = path.join(os.homedir(), '.dsh', 'dsh-xcc-pack-tools-settings.json');
+      const s = JSON.parse(await fs.readFile(sp, 'utf8'));
+      if (s.enginePaths && typeof s.enginePaths === 'object' && Object.keys(s.enginePaths).length === 0) {
+        delete s.enginePaths;
+        await fs.writeFile(sp, JSON.stringify(s, null, 2), 'utf8');
+      }
+    } catch { /* best effort */ }
     CURRENT_CWD = process.cwd();
     rmForce(fake.root);
   }
@@ -325,8 +459,23 @@ test('upload: latestZip matching, remote path validation, fake bdpan flow', asyn
     // Direct API status is intentionally independent from installed bdpan CLI.
     const st = await call('baiduStatus', {});
     assert.equal(st.status, 200);
-    assert.equal(st.json.value.configured, false);
-    assert.equal(st.json.value.authorized, false);
+    // This machine's ~/.dsh settings may already hold Baidu app credentials
+    // (the upload feature was configured for real) — assert only the
+    // deterministic shape, and probe the "blocked until configured" paths
+    // only on a clean machine.
+    assert.equal(typeof st.json.value.configured, 'boolean');
+    if (!st.json.value.configured) {
+      assert.equal(st.json.value.authorized, false);
+
+      // Direct upload is correctly blocked until app configuration exists.
+      const up = await call('uploadStart', { remoteDir: 'XCC-Deluxe/' });
+      assert.equal(up.status, 409);
+      assert.ok(up.json.error.message.includes('App Key'), up.json.error.message);
+
+      // Legacy remote-path validation is config-independent in intent.
+      const miss = await call('uploadStart', { remoteDir: '../evil/', localPath: 'nope.zip' });
+      assert.equal(miss.status, 409);
+    }
 
     // create release zips: latest = XCC-Deluxe-20260928-1.zip
     await fs.writeFile(path.join(fake.saved, 'XCC-Deluxe-20260927.zip'), 'z1');
@@ -337,15 +486,6 @@ test('upload: latestZip matching, remote path validation, fake bdpan flow', asyn
     assert.equal(root.json.value.latestZip.name, 'XCC-Deluxe-20260928-1');
     assert.equal(root.json.value.latestZip.isDir, false);
     assert.equal(root.json.value.latestZip.path, path.join(fake.saved, 'XCC-Deluxe-20260928-1.zip'));
-
-    // Direct upload is correctly blocked until app configuration + OAuth exist.
-    const up = await call('uploadStart', { remoteDir: 'XCC-Deluxe/' });
-    assert.equal(up.status, 409);
-    assert.ok(up.json.error.message.includes('App Key'), up.json.error.message);
-
-    // Legacy settings still work independently of direct API config.
-    const miss = await call('uploadStart', { remoteDir: '../evil/', localPath: 'nope.zip' });
-    assert.equal(miss.status, 409);
 
     // settings roundtrip (restore afterwards)
     const before = await call('settingsGet', {});
@@ -384,13 +524,17 @@ test('read-only root against the REAL project', async () => {
     assert.equal(v.projectRoot, REAL_PROJECT);
     assert.equal(v.hasBuild, true);
     assert.ok(v.webVersion && /^v\d+\.\d+\.\d+$/.test(v.webVersion.current), `webVersion.current should be vX.Y.Z, got ${v.webVersion?.current}`);
+    // engine state must be derived from the real uproject
+    assert.equal(v.ueVersion, '5.7', 'XCC.uproject EngineAssociation should read as 5.7');
+    assert.equal(v.ueAssociation, '5.7');
+    assert.ok([null, 'saved', 'registry', 'launcher', 'scan', 'env', 'requested'].includes(v.ueSource), `unexpected ueSource: ${v.ueSource}`);
     assert.ok(v.releases.length >= 1, 'real Saved should contain releases');
     assert.ok(v.releases.every((r) => /^XCC-Deluxe-\d{8}(?:-\d+)?$/.test(r.name)));
     const today = v.now;
     const n = await call('nextName', { date: today });
     assert.equal(n.status, 200);
     assert.ok(/^XCC-Deluxe-\d{8}(?:-\d+)?$/.test(n.json.value.name));
-    console.log(`real project: releases=${v.releases.length}, next=${n.json.value.name}, ueDir=${v.ueDir || '(not resolved)'}`);
+    console.log(`real project: releases=${v.releases.length}, next=${n.json.value.name}, ueVersion=${v.ueVersion}, ueDir=${v.ueDir || '(not resolved)'} (${v.ueSource || 'none'})`);
   } finally {
     CURRENT_CWD = process.cwd();
   }

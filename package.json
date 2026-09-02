@@ -1,7 +1,7 @@
 {
   "name": "dsh-xcc-pack-tools",
-  "description": "XCC-Deluxe project pack/build/release tools + sidebar UI for DeepSeek Harness: one-click UE packaging via package.ps1, Web UI builds via copy-dist-dev/prod.ps1, and release naming/zipping as XCC-Deluxe-{yyyyMMdd}(-N) under Saved/.",
-  "version": "0.1.0",
+  "description": "XCC-Deluxe project pack/build/release tools + sidebar UI for DeepSeek Harness: plugin-internal UE packaging (UAT BuildCookRun, no Web step; engine root auto-detected from the .uproject EngineAssociation with a per-project saved fallback), standalone Web UI builds via copy-dist-dev/prod.ps1, and release naming/zipping as XCC-Deluxe-{yyyyMMdd}(-N) under Saved/.",
+  "version": "0.2.0",
   "type": "module",
   "main": "lib/index.js",
   "license": "MIT",
