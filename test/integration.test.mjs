@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +19,16 @@ import { apply } from '../lib/index.js';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, '..');
 const REAL_PROJECT = 'D:\\Work\\HoloX\\XCC-Deluxe';
+
+/** True when a real UnrealEditor is running on this machine (the user may be
+ * using it); packStart jobs would correctly refuse with editor-running 409. */
+function editorIsRunning() {
+  return new Promise((resolve) => {
+    execFile('powershell.exe', ['-NoProfile', '-Command', '(Get-Process -Name UnrealEditor -ErrorAction SilentlyContinue | Measure-Object).Count'], { windowsHide: true }, (err, stdout) => {
+      resolve(!err && Number(String(stdout).trim()) > 0);
+    });
+  });
+}
 
 // Inject a FAKE bdpan CLI (a where.exe copy) via BDPAN_BIN so upload tests
 // are deterministic regardless of whether the machine has bdpan installed.
@@ -294,7 +304,8 @@ test('webBuildStart still standalone: script error surfaces in the job (no engin
     rmForce(fake.root);
   }
 });
-test('packEngineSet roundtrip + pack job over a saved fake engine root', async () => {
+test('packEngineSet roundtrip + pack job over a saved fake engine root', async (t) => {
+  if (await editorIsRunning()) { t.skip('Unreal Editor is running on this machine'); return; }
   const fake = await makeFakeProject();
   const engine = path.join(fake.root, 'FakeEngine');
   await fs.mkdir(path.join(engine, 'Engine', 'Build', 'BatchFiles'), { recursive: true });
@@ -364,7 +375,8 @@ test('packEngineSet roundtrip + pack job over a saved fake engine root', async (
     rmForce(fake.root);
   }
 });
-test('pack compile step runs UBT when present (regression: never spawns the .uproject)', async () => {
+test('pack compile step runs UBT when present (regression: never spawns the .uproject)', async (t) => {
+  if (await editorIsRunning()) { t.skip('Unreal Editor is running on this machine'); return; }
   const fake = await makeFakeProject();
   const engine = path.join(fake.root, 'FakeEngine');
   // Fake engine WITH a UBT exe (a where.exe copy — exits non-zero for our
@@ -393,6 +405,193 @@ test('pack compile step runs UBT when present (regression: never spawns the .upr
     const joined = pj.lines.join('\n');
     assert.ok(joined.includes('UBT:'), 'compile step should log the UBT command line');
     assert.ok(joined.includes('-Project='), 'UBT args should carry -Project=<uproject>');
+    assert.ok(joined.includes('XCCEditor'), 'compile must ALSO build the Editor target (cook serialization)');
+    assert.ok(joined.includes('-remoteini='), 'UBT args should match UAT shape (-remoteini)');
+    assert.ok(!joined.includes('-FromMsBuild') && !joined.includes('-WaitMutex'), 'stale MSBuild-only flags must be gone');
+  } finally {
+    CURRENT_CWD = fake.proj;
+    await call('packEngineSet', { engineDir: '' }).catch(() => {});
+    try {
+      const sp = path.join(os.homedir(), '.dsh', 'dsh-xcc-pack-tools-settings.json');
+      const s = JSON.parse(await fs.readFile(sp, 'utf8'));
+      if (s.enginePaths && typeof s.enginePaths === 'object' && Object.keys(s.enginePaths).length === 0) {
+        delete s.enginePaths;
+        await fs.writeFile(sp, JSON.stringify(s, null, 2), 'utf8');
+      }
+    } catch { /* best effort */ }
+    CURRENT_CWD = process.cwd();
+    rmForce(fake.root);
+  }
+});
+test('pack freshness gate: stale binaries abort before UAT; fresh binaries proceed', async (t) => {
+  if (await editorIsRunning()) { t.skip('Unreal Editor is running on this machine'); return; }
+  const fake = await makeFakeProject();
+  const engine = path.join(fake.root, 'FakeEngine');
+  await fs.mkdir(path.join(engine, 'Engine', 'Build', 'BatchFiles'), { recursive: true });
+  await fs.writeFile(path.join(engine, 'Engine', 'Build', 'BatchFiles', 'RunUAT.bat'),
+    '@echo off\r\necho FAKE-UAT-RAN\r\nexit /b 0\r\n');
+  const binDir = path.join(fake.proj, 'Binaries', 'Win64');
+  const srcDir = path.join(fake.proj, 'Source', 'XCC');
+  await fs.mkdir(binDir, { recursive: true });
+  await fs.mkdir(srcDir, { recursive: true });
+  const src = path.join(srcDir, 'NewFeature.cpp');
+  await fs.writeFile(src, '// new c++ feature\n');
+  const exe = path.join(binDir, 'XCC.exe');
+  const edDll = path.join(binDir, 'UnrealEditor-XCC.dll');
+  await fs.writeFile(exe, 'old exe');
+  await fs.writeFile(edDll, 'old editor dll');
+  try {
+    CURRENT_CWD = fake.proj;
+    await call('packEngineSet', { engineDir: engine });
+
+    // 1) binaries OLDER than the new source → job must abort BEFORE UAT
+    const old = new Date('2026-01-01T00:00:00Z');
+    const fresh = new Date(Date.now() + 60000);
+    await fs.utimes(src, fresh, fresh);
+    await fs.utimes(exe, old, old);
+    await fs.utimes(edDll, old, old);
+    const p1 = await call('packStart', { buildConfig: 'Development', skipCompile: true });
+    assert.equal(p1.status, 200);
+    const j1 = await waitJob('packPoll', p1.json.value.jobId, 30000);
+    assert.ok(j1.error, 'stale binaries must fail the job');
+    assert.ok(j1.error.includes('陈旧'), `error should explain staleness: ${j1.error}`);
+    assert.ok(!j1.lines.join('\n').includes('FAKE-UAT-RAN'), 'UAT must not run when binaries are stale');
+
+    // 2) binaries NEWER than the source → pack proceeds to UAT
+    await fs.utimes(exe, fresh, fresh);
+    await fs.utimes(edDll, fresh, fresh);
+    const p2 = await call('packStart', { buildConfig: 'Development', skipCompile: true });
+    assert.equal(p2.status, 200);
+    const j2 = await waitJob('packPoll', p2.json.value.jobId, 30000);
+    assert.equal(j2.error, undefined);
+    assert.ok(j2.lines.join('\n').includes('FAKE-UAT-RAN'), 'fresh binaries must reach UAT');
+  } finally {
+    CURRENT_CWD = fake.proj;
+    await call('packEngineSet', { engineDir: '' }).catch(() => {});
+    try {
+      const sp = path.join(os.homedir(), '.dsh', 'dsh-xcc-pack-tools-settings.json');
+      const s = JSON.parse(await fs.readFile(sp, 'utf8'));
+      if (s.enginePaths && typeof s.enginePaths === 'object' && Object.keys(s.enginePaths).length === 0) {
+        delete s.enginePaths;
+        await fs.writeFile(sp, JSON.stringify(s, null, 2), 'utf8');
+      }
+    } catch { /* best effort */ }
+    CURRENT_CWD = process.cwd();
+    rmForce(fake.root);
+  }
+});
+test('overview: prechecks and all-disabled gate', async () => {
+  const fake = await makeFakeProject();
+  try {
+    CURRENT_CWD = fake.proj;
+    // nothing enabled → 400
+    const none = await call('overviewStart', { stages: { pack: { enabled: false }, web: { enabled: false }, release: { enabled: false }, upload: { enabled: false } } });
+    assert.equal(none.status, 400);
+
+    // pack enabled but engine 9.9 unresolvable → 409 engine-not-found
+    const noEngine = await call('overviewStart', { stages: { pack: { enabled: true, skipCompile: true } } });
+    assert.equal(noEngine.status, 409);
+    assert.equal(noEngine.json.error.code, 'engine-not-found');
+
+    // release enabled without an existing build (and pack not enabled) → 409
+    await fs.rm(path.join(fake.win, 'XCC.exe'), { force: true });
+    const noBuild = await call('overviewStart', { stages: { release: { enabled: true } } });
+    assert.equal(noBuild.status, 409);
+    assert.ok(noBuild.json.error.message.includes('XCC.exe'), noBuild.json.error.message);
+
+    // invalid params → 400
+    const badCfg = await call('overviewStart', { stages: { pack: { enabled: true, buildConfig: 'Nope' } } });
+    assert.equal(badCfg.status, 400);
+  } finally {
+    CURRENT_CWD = process.cwd();
+    rmForce(fake.root);
+  }
+});
+test('overview pipeline: pack-only success, others skipped, stages aggregated', async (t) => {
+  if (await editorIsRunning()) { t.skip('Unreal Editor is running on this machine'); return; }
+  const fake = await makeFakeProject();
+  const engine = path.join(fake.root, 'FakeEngine');
+  await fs.mkdir(path.join(engine, 'Engine', 'Build', 'BatchFiles'), { recursive: true });
+  await fs.writeFile(path.join(engine, 'Engine', 'Build', 'BatchFiles', 'RunUAT.bat'),
+    '@echo off\r\necho FAKE-UAT-RAN\r\nexit /b 0\r\n');
+  try {
+    CURRENT_CWD = fake.proj;
+    await call('packEngineSet', { engineDir: engine });
+
+    const ov = await call('overviewStart', {
+      stages: {
+        pack: { enabled: true, buildConfig: 'Development', skipCompile: true },
+        web: { enabled: false },
+        release: { enabled: false },
+        upload: { enabled: false },
+      },
+    });
+    assert.equal(ov.status, 200);
+    assert.equal(ov.json.value.kind, 'overview');
+    const oj = await waitJob('overviewPoll', ov.json.value.jobId, 30000);
+    assert.equal(oj.stage, 'done');
+    assert.equal(oj.error, undefined);
+    assert.ok(Array.isArray(oj.stages), 'overview poll must carry stages');
+    const pack = oj.stages.find((s) => s.id === 'pack');
+    assert.equal(pack.status, 'done');
+    assert.equal(pack.percent, 100);
+    for (const id of ['web', 'release', 'upload']) {
+      assert.equal(oj.stages.find((s) => s.id === id).status, 'skipped');
+    }
+    const joined = oj.lines.join('\n');
+    assert.ok(joined.includes('FAKE-UAT-RAN'), `sub-job output should flow into overview log: ${joined.slice(-400)}`);
+    assert.ok(joined.includes('① UE 打包'), 'stage names should be used in log prefixes');
+    assert.ok(joined.includes('全部完成'), joined.slice(-300));
+  } finally {
+    CURRENT_CWD = fake.proj;
+    await call('packEngineSet', { engineDir: '' }).catch(() => {});
+    try {
+      const sp = path.join(os.homedir(), '.dsh', 'dsh-xcc-pack-tools-settings.json');
+      const s = JSON.parse(await fs.readFile(sp, 'utf8'));
+      if (s.enginePaths && typeof s.enginePaths === 'object' && Object.keys(s.enginePaths).length === 0) {
+        delete s.enginePaths;
+        await fs.writeFile(sp, JSON.stringify(s, null, 2), 'utf8');
+      }
+    } catch { /* best effort */ }
+    CURRENT_CWD = process.cwd();
+    rmForce(fake.root);
+  }
+});
+test('overview pipeline: failing stage aborts, later enabled stages stay pending', async (t) => {
+  if (await editorIsRunning()) { t.skip('Unreal Editor is running on this machine'); return; }
+  const fake = await makeFakeProject();
+  const engine = path.join(fake.root, 'FakeEngine');
+  await fs.mkdir(path.join(engine, 'Engine', 'Build', 'BatchFiles'), { recursive: true });
+  await fs.writeFile(path.join(engine, 'Engine', 'Build', 'BatchFiles', 'RunUAT.bat'),
+    '@echo off\r\necho FAKE-UAT-RAN\r\nexit /b 0\r\n');
+  // UBT exists but always exits non-zero → the pack stage must fail and abort
+  const ubtDir = path.join(engine, 'Engine', 'Binaries', 'DotNET', 'UnrealBuildTool');
+  await fs.mkdir(ubtDir, { recursive: true });
+  await fs.copyFile(path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'where.exe'),
+    path.join(ubtDir, 'UnrealBuildTool.exe'));
+  try {
+    CURRENT_CWD = fake.proj;
+    await call('packEngineSet', { engineDir: engine });
+
+    const ov = await call('overviewStart', {
+      stages: {
+        pack: { enabled: true, buildConfig: 'Development' }, // compile NOT skipped → fails
+        web: { enabled: false },
+        release: { enabled: true, zip: false },
+        upload: { enabled: false },
+      },
+    });
+    assert.equal(ov.status, 200);
+    const oj = await waitJob('overviewPoll', ov.json.value.jobId, 60000);
+    assert.equal(oj.running, false);
+    assert.ok(oj.error, 'overview should surface the failing stage');
+    assert.ok(oj.error.includes('① UE 打包'), `error should name the stage: ${oj.error}`);
+    const pack = oj.stages.find((s) => s.id === 'pack');
+    assert.equal(pack.status, 'failed');
+    assert.ok(pack.error && !pack.error.includes('ENOENT'), `stage error should be the UBT failure: ${pack.error}`);
+    const rel = oj.stages.find((s) => s.id === 'release');
+    assert.equal(rel.status, 'pending', 'aborted pipeline must leave later stages pending');
+    assert.ok(oj.lines.join('\n').includes('一键打包中止'), 'log should explain the abort');
   } finally {
     CURRENT_CWD = fake.proj;
     await call('packEngineSet', { engineDir: '' }).catch(() => {});
