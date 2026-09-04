@@ -133,8 +133,12 @@ test('decodeLine: utf8 passthrough and gbk fallback', () => {
 });
 
 test('parseWebVersion', () => {
-  assert.deepEqual(parseWebVersion('{"major":1,"minor":2,"patch":3}'), { major: 1, minor: 2, patch: 3 });
-  assert.deepEqual(parseWebVersion('{"major":0,"minor":0,"patch":0}'), { major: 0, minor: 0, patch: 0 });
+  assert.deepEqual(parseWebVersion('{"major":1,"minor":2,"patch":3}'), { major: 1, minor: 2, patch: 3, mode: undefined });
+  assert.deepEqual(parseWebVersion('{"major":0,"minor":0,"patch":0}'), { major: 0, minor: 0, patch: 0, mode: undefined });
+  assert.deepEqual(parseWebVersion('{"major":1,"minor":2,"patch":3,"mode":"prod"}'), { major: 1, minor: 2, patch: 3, mode: 'prod' });
+  assert.deepEqual(parseWebVersion('{"major":1,"minor":2,"patch":3,"mode":"development"}'), { major: 1, minor: 2, patch: 3, mode: 'dev' });
+  assert.deepEqual(parseWebVersion('{"major":1,"minor":2,"patch":3,"mode":"production"}'), { major: 1, minor: 2, patch: 3, mode: 'prod' });
+  assert.deepEqual(parseWebVersion('{"major":1,"minor":2,"patch":3,"mode":"staging"}'), { major: 1, minor: 2, patch: 3, mode: undefined }); // unknown mode ignored
   assert.equal(parseWebVersion('not json'), null);
   assert.equal(parseWebVersion('{"major":1,"minor":2}'), null);      // missing patch
   assert.equal(parseWebVersion('{"major":"x","minor":2,"patch":3}'), null);

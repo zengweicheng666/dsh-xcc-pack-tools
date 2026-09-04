@@ -175,7 +175,7 @@ test('root + nextName + release flow on a fake project', async () => {
     assert.equal(root.json.value.projectRoot, fake.proj);
     assert.equal(root.json.value.outputDir, fake.win);
     assert.equal(root.json.value.hasBuild, true);
-    assert.deepEqual(root.json.value.webVersion, { current: 'v1.2.3', next: 'v1.2.4' });
+    assert.deepEqual(root.json.value.webVersion, { current: 'v1.2.3', next: 'v1.2.4', mode: null });
     assert.ok(['7z', 'dotnet'].includes(root.json.value.zipTool), `zipTool should be 7z|dotnet, got ${root.json.value.zipTool}`);
     if (root.json.value.zipTool === '7z') assert.ok(root.json.value.sevenZip, 'sevenZip path should be reported when 7z is the tool');
     const names = root.json.value.releases.map((r) => r.name);
@@ -723,6 +723,7 @@ test('read-only root against the REAL project', async () => {
     assert.equal(v.projectRoot, REAL_PROJECT);
     assert.equal(v.hasBuild, true);
     assert.ok(v.webVersion && /^v\d+\.\d+\.\d+$/.test(v.webVersion.current), `webVersion.current should be vX.Y.Z, got ${v.webVersion?.current}`);
+    assert.ok(v.webVersion.mode === null || v.webVersion.mode === 'dev' || v.webVersion.mode === 'prod', `webVersion.mode should be null/dev/prod, got ${v.webVersion.mode}`);
     // engine state must be derived from the real uproject
     assert.equal(v.ueVersion, '5.7', 'XCC.uproject EngineAssociation should read as 5.7');
     assert.equal(v.ueAssociation, '5.7');
