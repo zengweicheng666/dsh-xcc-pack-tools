@@ -175,6 +175,8 @@ test('root + nextName + release flow on a fake project', async () => {
     assert.equal(root.json.value.projectRoot, fake.proj);
     assert.equal(root.json.value.outputDir, fake.win);
     assert.equal(root.json.value.hasBuild, true);
+    assert.equal(root.json.value.artifacts.build.valid, true);
+    assert.equal(root.json.value.artifacts.build.executable, path.join(fake.win, 'XCC.exe'));
     assert.deepEqual(root.json.value.webVersion, { current: 'v1.2.3', next: 'v1.2.4', mode: null });
     assert.ok(['7z', 'dotnet'].includes(root.json.value.zipTool), `zipTool should be 7z|dotnet, got ${root.json.value.zipTool}`);
     if (root.json.value.zipTool === '7z') assert.ok(root.json.value.sevenZip, 'sevenZip path should be reported when 7z is the tool');
@@ -259,6 +261,23 @@ test('release zip tool selection: explicit dotnet, explicit 7z, invalid', async 
     // invalid zipTool → 400
     const bad = await call('releaseStart', { date: '20260925', zipTool: 'rar' });
     assert.equal(bad.status, 400);
+  } finally {
+    CURRENT_CWD = process.cwd();
+    rmForce(fake.root);
+  }
+});
+test('release accepts an explicit project-relative sourceDir', async () => {
+  const fake = await makeFakeProject();
+  const alt = path.join(fake.saved, 'EditorArchive');
+  try {
+    await fs.mkdir(alt, { recursive: true });
+    await fs.copyFile(path.join(fake.win, 'XCC.exe'), path.join(alt, 'XCC.exe'));
+    CURRENT_CWD = fake.proj;
+    const r = await call('releaseStart', { date: '20260926', zip: false, sourceDir: 'Saved\\EditorArchive' });
+    assert.equal(r.status, 200);
+    const job = await waitJob('releasePoll', r.json.value.jobId, 60000);
+    assert.equal(job.error, undefined);
+    assert.equal(job.result.sourceDir, alt);
   } finally {
     CURRENT_CWD = process.cwd();
     rmForce(fake.root);
@@ -423,7 +442,7 @@ test('pack compile step runs UBT when present (regression: never spawns the .upr
     rmForce(fake.root);
   }
 });
-test('pack freshness gate: stale binaries abort before UAT; fresh binaries proceed', async (t) => {
+test('pack freshness policy: balanced warns and strict blocks stale binaries', async (t) => {
   if (await editorIsRunning()) { t.skip('Unreal Editor is running on this machine'); return; }
   const fake = await makeFakeProject();
   const engine = path.join(fake.root, 'FakeEngine');
@@ -444,20 +463,30 @@ test('pack freshness gate: stale binaries abort before UAT; fresh binaries proce
     CURRENT_CWD = fake.proj;
     await call('packEngineSet', { engineDir: engine });
 
-    // 1) binaries OLDER than the new source → job must abort BEFORE UAT
+    // 1) balanced mode reports a warning but still reaches UAT
     const old = new Date('2026-01-01T00:00:00Z');
     const fresh = new Date(Date.now() + 60000);
     await fs.utimes(src, fresh, fresh);
     await fs.utimes(exe, old, old);
     await fs.utimes(edDll, old, old);
-    const p1 = await call('packStart', { buildConfig: 'Development', skipCompile: true });
+    const p1 = await call('packStart', { buildConfig: 'Development', skipCompile: true, validationMode: 'balanced' });
     assert.equal(p1.status, 200);
     const j1 = await waitJob('packPoll', p1.json.value.jobId, 30000);
-    assert.ok(j1.error, 'stale binaries must fail the job');
-    assert.ok(j1.error.includes('陈旧'), `error should explain staleness: ${j1.error}`);
-    assert.ok(!j1.lines.join('\n').includes('FAKE-UAT-RAN'), 'UAT must not run when binaries are stale');
+    assert.equal(j1.error, undefined);
+    assert.equal(j1.diagnostics?.some((d) => d.code === 'build-freshness' && d.severity === 'warning'), true);
+    assert.ok(!j1.lines.join('\n').includes('编译产物新鲜度校验通过'), 'warning path must not claim freshness check passed');
+    assert.ok(j1.lines.join('\n').includes('FAKE-UAT-RAN'), 'balanced mode should allow UAT after explicit risk policy');
 
-    // 2) binaries NEWER than the source → pack proceeds to UAT
+    // 2) strict mode retains the hard safety gate
+    const pStrict = await call('packStart', { buildConfig: 'Development', skipCompile: true, validationMode: 'strict' });
+    assert.equal(pStrict.status, 200);
+    const js = await waitJob('packPoll', pStrict.json.value.jobId, 30000);
+    assert.ok(js.error?.includes('陈旧'), `strict error should explain staleness: ${js.error}`);
+    assert.equal(js.errorDetails?.code, 'build-freshness');
+    assert.equal(js.errorDetails?.severity, 'blocker');
+    assert.ok(!js.lines.join('\n').includes('FAKE-UAT-RAN'), 'strict mode must block UAT when binaries are stale');
+
+    // 3) binaries NEWER than the source → pack proceeds to UAT
     await fs.utimes(exe, fresh, fresh);
     await fs.utimes(edDll, fresh, fresh);
     const p2 = await call('packStart', { buildConfig: 'Development', skipCompile: true });
@@ -480,6 +509,31 @@ test('pack freshness gate: stale binaries abort before UAT; fresh binaries proce
     rmForce(fake.root);
   }
 });
+test('pack policy is explicit and compatibility defaults to ignored Cook errors', async (t) => {
+  if (await editorIsRunning()) { t.skip('Unreal Editor is running on this machine'); return; }
+  const fake = await makeFakeProject();
+  const engine = path.join(fake.root, 'FakeEngine');
+  await fs.mkdir(path.join(engine, 'Engine', 'Build', 'BatchFiles'), { recursive: true });
+  await fs.writeFile(path.join(engine, 'Engine', 'Build', 'BatchFiles', 'RunUAT.bat'), '@echo off\r\necho FAKE-UAT-RAN\r\nexit /b 0\r\n');
+  try {
+    CURRENT_CWD = fake.proj;
+    await call('packEngineSet', { engineDir: engine });
+    const compat = await call('packStart', { validationMode: 'compatibility', skipCompile: true });
+    const cj = await waitJob('packPoll', compat.json.value.jobId, 30000);
+    assert.deepEqual(cj.policy, { validationMode: 'compatibility', cookErrorPolicy: 'ignore' });
+    assert.equal(cj.mayBeIncomplete, true);
+    assert.ok(cj.lines.join('\n').includes('-IgnoreCookErrors'));
+    const explicit = await call('packStart', { validationMode: 'compatibility', cookErrorPolicy: 'surface', skipCompile: true });
+    const ej = await waitJob('packPoll', explicit.json.value.jobId, 30000);
+    assert.deepEqual(ej.policy, { validationMode: 'compatibility', cookErrorPolicy: 'surface' });
+    assert.ok(!ej.lines.join('\n').includes('-IgnoreCookErrors'));
+  } finally {
+    CURRENT_CWD = fake.proj;
+    await call('packEngineSet', { engineDir: '' }).catch(() => {});
+    CURRENT_CWD = process.cwd();
+    rmForce(fake.root);
+  }
+});
 test('overview: prechecks and all-disabled gate', async () => {
   const fake = await makeFakeProject();
   try {
@@ -492,6 +546,8 @@ test('overview: prechecks and all-disabled gate', async () => {
     const noEngine = await call('overviewStart', { stages: { pack: { enabled: true, skipCompile: true } } });
     assert.equal(noEngine.status, 409);
     assert.equal(noEngine.json.error.code, 'engine-not-found');
+    assert.equal(noEngine.json.error.severity, 'blocker');
+    assert.ok(Array.isArray(noEngine.json.error.actions));
 
     // release enabled without an existing build (and pack not enabled) → 409
     await fs.rm(path.join(fake.win, 'XCC.exe'), { force: true });
@@ -503,6 +559,30 @@ test('overview: prechecks and all-disabled gate', async () => {
     const badCfg = await call('overviewStart', { stages: { pack: { enabled: true, buildConfig: 'Nope' } } });
     assert.equal(badCfg.status, 400);
   } finally {
+    CURRENT_CWD = process.cwd();
+    rmForce(fake.root);
+  }
+});
+test('overview propagates top-level Cook policy and retains stage diagnostics', async (t) => {
+  if (await editorIsRunning()) { t.skip('Unreal Editor is running on this machine'); return; }
+  const fake = await makeFakeProject();
+  const engine = path.join(fake.root, 'FakeEngine');
+  await fs.mkdir(path.join(engine, 'Engine', 'Build', 'BatchFiles'), { recursive: true });
+  await fs.writeFile(path.join(engine, 'Engine', 'Build', 'BatchFiles', 'RunUAT.bat'), '@echo off\r\necho FAKE-UAT-RAN\r\nexit /b 0\r\n');
+  try {
+    CURRENT_CWD = fake.proj;
+    await call('packEngineSet', { engineDir: engine });
+    const r = await call('overviewStart', {
+      validationMode: 'compatibility', cookErrorPolicy: 'surface',
+      stages: { pack: { enabled: true, skipCompile: true }, web: { enabled: false }, release: { enabled: false }, upload: { enabled: false } },
+    });
+    assert.equal(r.status, 200);
+    const j = await waitJob('overviewPoll', r.json.value.jobId, 30000);
+    assert.equal(j.error, undefined);
+    assert.deepEqual(j.result.stages[0].result?.policy, { validationMode: 'compatibility', cookErrorPolicy: 'surface' });
+  } finally {
+    CURRENT_CWD = fake.proj;
+    await call('packEngineSet', { engineDir: '' }).catch(() => {});
     CURRENT_CWD = process.cwd();
     rmForce(fake.root);
   }

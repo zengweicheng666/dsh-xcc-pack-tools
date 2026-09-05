@@ -99,6 +99,7 @@ test('scanReleases: shape and ordering', async () => {
     await mk('XCC-Deluxe-20260922-1', true);
     await mk('XCC-Deluxe-20260922-2.zip', false);
     await mk('XCC-Deluxe-20260921.zip', false);
+    await mk('XCC-Deluxe-20260919', false); // matching name, but a regular file
     await mk('unrelated.txt', false);
     await mk('XCC-Deluxe-202609221.zip', false); // 9 digits — ignored
     const entries = await scanReleases(dir);
@@ -108,7 +109,11 @@ test('scanReleases: shape and ordering', async () => {
       'XCC-Deluxe-20260922',
       'XCC-Deluxe-20260921',
       'XCC-Deluxe-20260920',
+      'XCC-Deluxe-20260919',
     ]);
+    const impostor = entries.find((e) => e.name === 'XCC-Deluxe-20260919');
+    assert.equal(impostor.isDir, false);
+    assert.equal(computeReleaseName(entries, '20260919').name, 'XCC-Deluxe-20260919');
     const z = entries.find((e) => e.name === 'XCC-Deluxe-20260922-2');
     assert.equal(z.isDir, false);
     assert.equal(z.size, 1);
