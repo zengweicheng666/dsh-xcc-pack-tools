@@ -188,6 +188,9 @@ test('root + nextName + release flow on a fake project', async () => {
     assert.equal(n1.status, 200);
     assert.equal(n1.json.value.name, 'XCC-Deluxe-20260922');
     assert.equal(n1.json.value.number, undefined);
+    // no remoteDir → the netdisk floor is gated off (agent tools/tests keep
+    // the pure local rule; the UI always sends remoteDir explicitly)
+    assert.equal(n1.json.value.netdisk, null);
 
     // 2. release without zip
     const r1 = await call('releaseStart', { date: '20260922', zip: false });
@@ -225,6 +228,30 @@ test('root + nextName + release flow on a fake project', async () => {
     rmForce(fake.root);
   }
 });
+test('baiduDirLatest: shape and authorized gate regardless of machine auth state', async () => {
+  const fake = await makeFakeProject();
+  try {
+    CURRENT_CWD = fake.proj;
+    // a deliberately bogus dir keeps the query away from real netdisk data;
+    // unauthorized machines short-circuit without any network call
+    const { status, json } = await call('baiduDirLatest', { remoteDir: '__dsh_test_nonexistent_xyz__' });
+    assert.equal(status, 200);
+    assert.equal(typeof json.value.authorized, 'boolean');
+    assert.ok('name' in json.value, 'response must carry name');
+    assert.ok('error' in json.value, 'response must carry error');
+    if (!json.value.authorized) {
+      assert.equal(json.value.name, null);
+      assert.equal(json.value.error, null);
+    } else {
+      assert.ok(json.value.name === null || typeof json.value.name === 'string');
+      assert.ok(json.value.error === null || typeof json.value.error === 'string');
+    }
+  } finally {
+    CURRENT_CWD = process.cwd();
+    rmForce(fake.root);
+  }
+});
+
 test('release zip tool selection: explicit dotnet, explicit 7z, invalid', async () => {
   const fake = await makeFakeProject();
   try {
@@ -553,7 +580,8 @@ test('overview: prechecks and all-disabled gate', async () => {
     await fs.rm(path.join(fake.win, 'XCC.exe'), { force: true });
     const noBuild = await call('overviewStart', { stages: { release: { enabled: true } } });
     assert.equal(noBuild.status, 409);
-    assert.ok(noBuild.json.error.message.includes('XCC.exe'), noBuild.json.error.message);
+    assert.equal(noBuild.json.error.code, 'artifact-not-found');
+    assert.ok(noBuild.json.error.message.includes('发布来源中未找到可执行文件'), noBuild.json.error.message);
 
     // invalid params → 400
     const badCfg = await call('overviewStart', { stages: { pack: { enabled: true, buildConfig: 'Nope' } } });

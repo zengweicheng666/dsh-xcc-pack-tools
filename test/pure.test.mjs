@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseReleaseName, localDateStamp, computeReleaseName, scanReleases, decodeLine, parseWebVersion, bumpWebVersion, versionText, resolveRemotePath, parseUproject, isVersionAssociation, ueVersionKey, parseLauncherInstalled } from '../lib/pure.js';
+import { parseReleaseName, localDateStamp, computeReleaseName, scanReleases, decodeLine, parseWebVersion, bumpWebVersion, versionText, resolveRemotePath, parseUproject, isVersionAssociation, ueVersionKey, parseLauncherInstalled, latestRemoteZipName, applyRemoteFloor, normalizeReleasePrefix } from '../lib/pure.js';
 
 test('parseReleaseName', () => {
   assert.deepEqual(parseReleaseName('XCC-Deluxe-20260922'), { date: '20260922', number: undefined });
@@ -86,6 +86,131 @@ test('computeReleaseName: invalid manual numbers throw', () => {
   // empty string means auto
   assert.equal(computeReleaseName([], '20260922', '').name, 'XCC-Deluxe-20260922');
   assert.equal(computeReleaseName([], '20260922', null).name, 'XCC-Deluxe-20260922');
+});
+
+test('latestRemoteZipName: ranks by name (date desc, number desc), ignoring mtimes and order', () => {
+  // deliberately shuffled with misleading mtime/size fields — the pick must
+  // come from the parsed NAME only
+  const entries = [
+    { name: 'XCC-Deluxe-20260922-1.zip', isdir: 0, server_mtime: 9999999999 },
+    { name: 'XCC-Deluxe-20260922.zip', isdir: 0, server_mtime: 1 },
+    { name: 'XCC-Deluxe-20260921-9.zip', isdir: 0 },
+    { name: 'XCC-Deluxe-20260923-2.zip', isdir: 0 },
+    { name: 'XCC-Deluxe-20260923-10.zip', isdir: 0 },
+    { name: 'XCC-Deluxe-20260923-3.zip', isdir: 0 },
+  ];
+  assert.deepEqual(latestRemoteZipName(entries), { name: 'XCC-Deluxe-20260923-10.zip', date: '20260923', number: 10 });
+});
+
+test('latestRemoteZipName: plain name counts as number 0 and loses to -1', () => {
+  const entries = [
+    { name: 'XCC-Deluxe-20260922.zip', isdir: 0 },
+    { name: 'XCC-Deluxe-20260922-1.zip', isdir: 0 },
+  ];
+  assert.deepEqual(latestRemoteZipName(entries), { name: 'XCC-Deluxe-20260922-1.zip', date: '20260922', number: 1 });
+});
+
+test('latestRemoteZipName: ignores dirs, non-zips, foreign prefixes and malformed names', () => {
+  const entries = [
+    { name: 'XCC-Deluxe-20260922-5.zip', isdir: 1 },      // a folder named like a zip
+    { name: 'XCC-Deluxe-20260922-6.zip.tmp', isdir: 0 },  // not .zip
+    { name: 'OtherProject-20260925-7.zip', isdir: 0 },    // foreign prefix
+    { name: 'XCC-Deluxe-202609221.zip', isdir: 0 },       // 9-digit date
+    { name: 'XCC-Deluxe-20260922-abc.zip', isdir: 0 },    // non-numeric suffix
+    { name: '', isdir: 0 },
+    { name: 'XCC-Deluxe-20260924.zip', isdir: 0 },
+  ];
+  assert.deepEqual(latestRemoteZipName(entries), { name: 'XCC-Deluxe-20260924.zip', date: '20260924', number: 0 });
+});
+
+test('latestRemoteZipName: empty or non-array input yields null', () => {
+  assert.equal(latestRemoteZipName([]), null);
+  assert.equal(latestRemoteZipName(undefined), null);
+  assert.equal(latestRemoteZipName([{ name: 'readme.txt', isdir: 0 }]), null);
+});
+
+test('applyRemoteFloor: remote null keeps the local name untouched', () => {
+  const next = computeReleaseName([], '20260922', undefined);
+  const out = applyRemoteFloor(next, null, 'XCC-Deluxe-');
+  assert.equal(out.name, 'XCC-Deluxe-20260922');
+  assert.equal(out.adjusted, false);
+  assert.equal(out.remote, null);
+});
+
+test('applyRemoteFloor: A < B on the same date advances to B + 1', () => {
+  const next = computeReleaseName([], '20260922', undefined); // A = plain (0)
+  const remote = { name: 'XCC-Deluxe-20260922-3.zip', date: '20260922', number: 3 };
+  const out = applyRemoteFloor(next, remote, 'XCC-Deluxe-');
+  assert.equal(out.name, 'XCC-Deluxe-20260922-4');
+  assert.equal(out.number, 4);
+  assert.equal(out.adjusted, true);
+  assert.equal(out.remote, remote.name);
+  assert.deepEqual(out.collisions, []);
+});
+
+test('applyRemoteFloor: A == B advances to B + 1', () => {
+  const next = computeReleaseName([], '20260922', 3); // A = -3
+  const remote = { name: 'XCC-Deluxe-20260922-3.zip', date: '20260922', number: 3 };
+  const out = applyRemoteFloor(next, remote, 'XCC-Deluxe-');
+  assert.equal(out.name, 'XCC-Deluxe-20260922-4');
+  assert.equal(out.adjusted, true);
+});
+
+test('applyRemoteFloor: A > B keeps A (manual number wins)', () => {
+  const next = computeReleaseName([], '20260922', 9);
+  const remote = { name: 'XCC-Deluxe-20260922-3.zip', date: '20260922', number: 3 };
+  const out = applyRemoteFloor(next, remote, 'XCC-Deluxe-');
+  assert.equal(out.name, 'XCC-Deluxe-20260922-9');
+  assert.equal(out.adjusted, false);
+  assert.equal(out.remote, remote.name);
+});
+
+test('applyRemoteFloor: today beats yesterday — A > B by date keeps A', () => {
+  const next = computeReleaseName([], '20260922', undefined);
+  const remote = { name: 'XCC-Deluxe-20260921-5.zip', date: '20260921', number: 5 };
+  const out = applyRemoteFloor(next, remote, 'XCC-Deluxe-');
+  assert.equal(out.name, 'XCC-Deluxe-20260922');
+  assert.equal(out.adjusted, false);
+});
+
+test('applyRemoteFloor: newer remote date carries over into the adjusted name', () => {
+  const next = computeReleaseName([], '20260922', 1);
+  const remote = { name: 'XCC-Deluxe-20260923-2.zip', date: '20260923', number: 2 };
+  const out = applyRemoteFloor(next, remote, 'XCC-Deluxe-');
+  assert.equal(out.name, 'XCC-Deluxe-20260923-3');
+  assert.equal(out.date, '20260923');
+  assert.equal(out.number, 3);
+  assert.equal(out.adjusted, true);
+});
+
+test('applyRemoteFloor: plain remote name advances to -1', () => {
+  const next = computeReleaseName([], '20260922', undefined);
+  const remote = { name: 'XCC-Deluxe-20260922.zip', date: '20260922', number: 0 };
+  const out = applyRemoteFloor(next, remote, 'XCC-Deluxe-');
+  assert.equal(out.name, 'XCC-Deluxe-20260922-1');
+  assert.equal(out.adjusted, true);
+});
+
+test('applyRemoteFloor: adjusted name is re-checked against local releases', () => {
+  const releases = [
+    { date: '20260922', number: 4, name: 'XCC-Deluxe-20260922-4', isDir: true },
+  ];
+  const next = computeReleaseName([], '20260922', undefined);
+  const remote = { name: 'XCC-Deluxe-20260922-3.zip', date: '20260922', number: 3 };
+  const out = applyRemoteFloor(next, remote, 'XCC-Deluxe-', releases);
+  assert.equal(out.name, 'XCC-Deluxe-20260922-4');
+  assert.ok(out.collisions.some((c) => c.includes('发布目录 XCC-Deluxe-20260922-4 已存在')));
+  // and a clean name reports no collisions
+  const clean = applyRemoteFloor(next, { name: 'XCC-Deluxe-20260922-2.zip', date: '20260922', number: 2 }, 'XCC-Deluxe-', releases);
+  assert.deepEqual(clean.collisions, []);
+});
+
+test('applyRemoteFloor: normalized prefix matches custom project names', () => {
+  const next = { date: '20260922', number: undefined, name: 'MyGame-20260922', collisions: [] };
+  const remote = { name: 'MyGame-20260922-2.zip', date: '20260922', number: 2 };
+  const out = applyRemoteFloor(next, remote, 'MyGame');
+  assert.equal(out.name, 'MyGame-20260922-3');
+  assert.equal(normalizeReleasePrefix('MyGame'), 'MyGame-');
 });
 
 test('scanReleases: shape and ordering', async () => {
