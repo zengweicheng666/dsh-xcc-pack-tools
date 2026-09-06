@@ -3,7 +3,35 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseReleaseName, localDateStamp, computeReleaseName, scanReleases, decodeLine, parseWebVersion, bumpWebVersion, versionText, resolveRemotePath, parseUproject, isVersionAssociation, ueVersionKey, parseLauncherInstalled, latestRemoteZipName, applyRemoteFloor, normalizeReleasePrefix } from '../lib/pure.js';
+import { parseReleaseName, localDateStamp, computeReleaseName, scanReleases, decodeLine, parseWebVersion, bumpWebVersion, versionText, resolveRemotePath, parseUproject, isVersionAssociation, ueVersionKey, parseLauncherInstalled, latestRemoteZipName, applyRemoteFloor, normalizeReleasePrefix, resolveEffectiveReleaseProjectName, releasePrefixCandidates } from '../lib/pure.js';
+
+test('resolveEffectiveReleaseProjectName: custom wins, then history tail, then directory', () => {
+  assert.deepEqual(resolveEffectiveReleaseProjectName({ override: 'MyGame', history: ['Old'], directoryName: 'Folder' }), { name: 'MyGame', source: 'custom' });
+  assert.deepEqual(resolveEffectiveReleaseProjectName({ override: '', history: ['A', 'B'], directoryName: 'Folder' }), { name: 'B', source: 'history' });
+  assert.deepEqual(resolveEffectiveReleaseProjectName({ override: '  ', history: ['Only'], directoryName: 'Folder' }), { name: 'Only', source: 'history' });
+  assert.deepEqual(resolveEffectiveReleaseProjectName({ override: '', history: [], directoryName: 'Folder' }), { name: 'Folder', source: 'directory' });
+  assert.deepEqual(resolveEffectiveReleaseProjectName({ history: ['', '  ', null, undefined] }), { name: '', source: 'directory' });
+  assert.deepEqual(resolveEffectiveReleaseProjectName({}), { name: '', source: 'directory' });
+  assert.deepEqual(resolveEffectiveReleaseProjectName({ history: 'not-an-array', directoryName: 'Dir' }), { name: 'Dir', source: 'directory' });
+});
+
+test('releasePrefixCandidates: normalized, deduped, no built-in prefix injected', () => {
+  assert.deepEqual(
+    releasePrefixCandidates({ projectName: 'XCC-Deluxe', directoryName: 'XCC-Deluxe', historicalNames: ['XCC-DeluxeT', 'XCC-Deluxe'] }),
+    ['XCC-Deluxe-', 'XCC-DeluxeT-']);
+  assert.deepEqual(
+    releasePrefixCandidates({ projectName: 'MyGame', directoryName: 'MyGame', historicalNames: ['OldName'] }),
+    ['MyGame-', 'OldName-']);
+  // the historical default (XCC-Deluxe) must never be injected on its own
+  const candidates = releasePrefixCandidates({ projectName: 'MyGame', directoryName: 'Folder', historicalNames: [] });
+  assert.deepEqual(candidates, ['MyGame-', 'Folder-']);
+  assert.ok(!candidates.some((p) => p.toLowerCase().startsWith('xcc-deluxe')), 'no hardcoded default prefix may be injected');
+  // dedup is case-insensitive, first spelling wins
+  assert.deepEqual(releasePrefixCandidates({ projectName: 'xcc-deluxe', directoryName: 'XCC-Deluxe' }), ['xcc-deluxe-']);
+  // trailing hyphens normalized, junk input dropped
+  assert.deepEqual(releasePrefixCandidates({ projectName: 'foo-', directoryName: '', historicalNames: [null, 42] }), ['foo-']);
+  assert.deepEqual(releasePrefixCandidates({}), []);
+});
 
 test('parseReleaseName', () => {
   assert.deepEqual(parseReleaseName('XCC-Deluxe-20260922'), { date: '20260922', number: undefined });

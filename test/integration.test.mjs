@@ -228,6 +228,110 @@ test('root + nextName + release flow on a fake project', async () => {
     rmForce(fake.root);
   }
 });
+test('releaseDelete: pair delete (dir + zip), validation, idempotency errors', async () => {
+  const fake = await makeFakeProject();
+  try {
+    CURRENT_CWD = fake.proj;
+    const dir = path.join(fake.saved, 'XCC-Deluxe-20260922');
+    const zip = path.join(fake.saved, 'XCC-Deluxe-20260922.zip');
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, 'XCC.exe'), 'exe');
+    await fs.writeFile(zip, 'zip');
+
+    let r = await call('root', {});
+    assert.equal(r.status, 200);
+    assert.ok(r.json.value.releases.some((x) => x.name === 'XCC-Deluxe-20260922' && x.isDir), 'dir row present before delete');
+    assert.ok(r.json.value.releases.some((x) => x.name === 'XCC-Deluxe-20260922' && !x.isDir), 'zip row present before delete');
+
+    // deleting by name removes BOTH the folder and the same-name zip
+    const del = await call('releaseDelete', { name: 'XCC-Deluxe-20260922' });
+    assert.equal(del.status, 200);
+    assert.deepEqual(del.json.value.deleted, { dir: true, zip: true });
+    await assert.rejects(fs.stat(dir));
+    await assert.rejects(fs.stat(zip));
+
+    r = await call('root', {});
+    assert.equal(r.status, 200);
+    assert.ok(!r.json.value.releases.some((x) => x.name === 'XCC-Deluxe-20260922'), 'deleted release must disappear from the list');
+
+    // the deletion frees the plain name again for the same date
+    const n = await call('nextName', { date: '20260922' });
+    assert.equal(n.status, 200);
+    assert.equal(n.json.value.name, 'XCC-Deluxe-20260922');
+
+    // zip-only pair deletes just the zip
+    await fs.writeFile(zip, 'zip');
+    const zOnly = await call('releaseDelete', { name: 'XCC-Deluxe-20260922' });
+    assert.equal(zOnly.status, 200);
+    assert.deepEqual(zOnly.json.value.deleted, { dir: false, zip: true });
+    await assert.rejects(fs.stat(zip));
+
+    // dir-only pair deletes just the dir
+    await fs.mkdir(dir, { recursive: true });
+    const dOnly = await call('releaseDelete', { name: 'XCC-Deluxe-20260922' });
+    assert.equal(dOnly.status, 200);
+    assert.deepEqual(dOnly.json.value.deleted, { dir: true, zip: false });
+    await assert.rejects(fs.stat(dir));
+
+    // nothing left → 409
+    const gone = await call('releaseDelete', { name: 'XCC-Deluxe-20260922' });
+    assert.equal(gone.status, 409);
+
+    // traversal / foreign / malformed names → 400, never touching Saved\
+    for (const bad of ['..\\..\\Windows', 'Other-20260922', '', 'XCC-Deluxe-2026', 'XCC-Deluxe-20260922-abc']) {
+      const b = await call('releaseDelete', { name: bad });
+      assert.equal(b.status, 400, `name ${JSON.stringify(bad)} must be rejected`);
+    }
+  } finally {
+    CURRENT_CWD = process.cwd();
+    rmForce(fake.root);
+  }
+});
+test('release project name: history tail becomes the automatic name (no hardcoded prefix)', async () => {
+  const fake = await makeFakeProject();
+  try {
+    CURRENT_CWD = fake.proj;
+
+    let r = await call('root', {});
+    assert.equal(r.status, 200);
+    assert.equal(r.json.value.projectName, 'XCC-Deluxe'); // directory name first
+    assert.equal(r.json.value.projectNameSource, 'directory');
+
+    // a custom name wins over the directory name
+    const set = await call('releaseProjectNameSet', { projectName: 'OldName' });
+    assert.equal(set.status, 200);
+    r = await call('root', {});
+    assert.equal(r.json.value.projectName, 'OldName');
+    assert.equal(r.json.value.projectNameSource, 'custom');
+
+    // clearing the override falls back to the most recent historical name
+    await call('releaseProjectNameSet', { projectName: '' });
+    r = await call('root', {});
+    assert.equal(r.json.value.projectName, 'OldName');
+    assert.equal(r.json.value.projectNameSource, 'history');
+    assert.equal(r.json.value.releasePrefix, 'OldName-');
+    assert.equal(r.json.value.projectNameCustomized, false);
+    const n = await call('nextName', { date: '20260922' });
+    assert.equal(n.status, 200);
+    assert.equal(n.json.value.name, 'OldName-20260922');
+  } finally {
+    // drop the fake project's persisted name state so the user's real
+    // settings file stays clean
+    await call('releaseProjectNameSet', { projectName: '' }).catch(() => {});
+    try {
+      const sp = path.join(os.homedir(), '.dsh', 'dsh-xcc-pack-tools-settings.json');
+      const s = JSON.parse(await fs.readFile(sp, 'utf8'));
+      const key = fake.proj.toLowerCase();
+      if (s.releaseProjectNameHistory && s.releaseProjectNameHistory[key]) delete s.releaseProjectNameHistory[key];
+      if (s.releaseProjectNames && s.releaseProjectNames[key]) delete s.releaseProjectNames[key];
+      if (s.releaseProjectNameHistory && Object.keys(s.releaseProjectNameHistory).length === 0) delete s.releaseProjectNameHistory;
+      if (s.releaseProjectNames && Object.keys(s.releaseProjectNames).length === 0) delete s.releaseProjectNames;
+      await fs.writeFile(sp, JSON.stringify(s, null, 2), 'utf8');
+    } catch { /* best effort */ }
+    CURRENT_CWD = process.cwd();
+    rmForce(fake.root);
+  }
+});
 test('baiduDirLatest: shape and authorized gate regardless of machine auth state', async () => {
   const fake = await makeFakeProject();
   try {
