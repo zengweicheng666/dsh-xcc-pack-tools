@@ -32,6 +32,14 @@ pnpm add file:./plugins/dsh-xcc-pack-tools
 
 并确保 `package.json` 的 `dsh.profile.bundles` 中包含 `dsh-xcc-pack-tools`。重启 dsh web 后生效。
 
+### DSH 版本兼容
+
+- 本版（0.3.3）适配 **DSH 0.2.1-rc.2**（桌面版升级后的运行时）：
+  - 不再注入 `webRuntime`——该服务在 DSH 0.2.x 已移除；继续声明会让整个插件一直处于未激活状态（工具与侧边栏都不出现）。
+  - `/pack/api` 的 Host/Origin 鉴权优先使用 0.2.x 的 `ctx.connection.isTrusted()`；旧版 DSH 则回退到 `ctx.webRuntime.trustedHosts` + 本机 loopback 校验。
+  - `package.json` 增加 `engines.dsh: ">=0.1.0-rc.6 <0.3.0-0"`，并按运行时版本放宽 `@deepseek-ai/dsh-tools` peer 范围，避免被 DSH 的精确版本兼容检查禁用。
+- 若从旧版升级后插件仍未出现：完全退出并重启 DSH（服务端 `lib/index.js` 只在启动时加载），再确认 profile 的 `compatibility.json` 里没有把本插件旧版本锁在旧运行时上（本版不再需要豁免）。
+
 ## 开发
 
 - 改 `lib/client.js`：`Copy-Item` 覆盖 `node_modules\dsh-xcc-pack-tools\lib\client.js` 后刷新页面即生效（客户端 bundle 实时读盘，无需重启）。

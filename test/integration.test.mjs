@@ -14,7 +14,7 @@ import { spawn, execFile } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { apply } from '../lib/index.js';
+import { apply, inject } from '../lib/index.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, '..');
@@ -71,8 +71,8 @@ function makeReq(apiMethod, bodyObj) {
     },
   };
   req.__start = () => {
-    dataCb(Buffer.from(body));
-    endCb();
+    dataCb?.(Buffer.from(body));
+    endCb?.();
   };
   return req;
 }
@@ -139,6 +139,43 @@ test('plugin applies: route + 4 agent tools registered', () => {
   const packTool = registeredTools.find((t) => t.name === 'xcc_pack');
   assert.ok(packTool, 'xcc_pack tool registered');
   assert.ok(!JSON.stringify(packTool).includes('skipWebBuild'), 'xcc_pack must not expose skipWebBuild');
+});
+
+test('inject: no removed host services (DSH 0.2.x removed webRuntime)', () => {
+  // DSH 0.2.x has no `webRuntime` service. Declaring it in `inject` keeps the
+  // whole plugin inactive forever, so it must never come back.
+  assert.deepEqual([...inject].sort(), ['sessions', 'tools', 'webServer']);
+  assert.ok(!inject.includes('webRuntime'));
+});
+
+test('api trust: DSH 0.2.x connection.isTrusted is honoured without webRuntime', async () => {
+  let connRoute;
+  const connCtx = {
+    sessions: { get: () => undefined },
+    get: (name) => name === 'connection'
+      ? { isTrusted: (request) => request.headers.host === 'trusted.example' }
+      : undefined,
+    webServer: { register: (d) => { connRoute = d; } },
+    tools: { register: () => {} },
+    effect: (fn) => fn(),
+  };
+  apply(connCtx);
+  assert.ok(connRoute, 'route registered with a connection-only ctx');
+
+  const hit = async (host) => {
+    const req = makeReq('no-such-method', {});
+    req.headers.host = host;
+    const res = makeRes();
+    const pending = connRoute.handler(req, res);
+    req.__start();
+    await pending;
+    return res.status;
+  };
+
+  // Reaching the API dispatch (404 for an unknown method) proves the trust gate
+  // passed; 403 proves the gate rejected the authority.
+  assert.equal(await hit('trusted.example'), 404, 'connection.isTrusted(true) must allow the call');
+  assert.equal(await hit('untrusted.example'), 403, 'connection.isTrusted(false) must fence the call');
 });
 
 async function zipEntries(zipPath) {
